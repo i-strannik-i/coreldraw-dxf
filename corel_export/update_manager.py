@@ -1,4 +1,4 @@
-"""Opt-in updates from the department's locally synced release folder."""
+"""Background release discovery and explicitly confirmed installation."""
 import hashlib
 import json
 import os
@@ -58,6 +58,15 @@ def check_latest(folder):
     if not releases:
         raise ValueError('GitHub и резервная папка недоступны: ' + '; '.join(failures))
     return max(releases, key=lambda info: version_tuple(info['version']))
+
+
+def automatic_release(folder):
+    """A failed background check must not interrupt the designer's work."""
+    try:
+        release = check_latest(folder)
+        return release if release['available'] else None
+    except Exception:
+        return None
 
 
 def stage_update(folder, info, cache):
@@ -147,6 +156,9 @@ def main():
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
     root = tk.Tk()
+    automatic = '--auto' in sys.argv
+    if automatic:
+        root.withdraw()
     root.title('Обновления CorelDRAW → DXF')
     root.geometry('610x330')
     root.resizable(False, False)
@@ -180,7 +192,7 @@ def main():
                     subprocess.Popen([str(path)])
                     events.put(('launched', None))
                 else:
-                    events.put(('release', check_latest(source)))
+                    events.put(('release', automatic_release(source) if automatic else check_latest(source)))
             except Exception as error:
                 events.put(('error', str(error)))
         threading.Thread(target=worker, daemon=True).start()
@@ -201,6 +213,12 @@ def main():
             state['busy'] = False
             state['release'] = value if kind == 'release' else None
             if kind == 'release':
+                if automatic and value is None:
+                    root.destroy()
+                    return
+                if automatic:
+                    root.deiconify()
+                    root.lift()
                 status.set('Доступна версия ' + value['version'] if value['available'] else 'Установлена актуальная версия. Обновление не требуется.')
                 apply.configure(state='normal' if value['available'] else 'disabled')
             elif kind == 'launched':
@@ -213,6 +231,7 @@ def main():
 
     ttk.Button(row, text='Проверить', command=work).pack(side='left')
     ttk.Button(row, text='Выбрать папку', command=choose).pack(side='left', padx=6)
+    ttk.Button(row, text='Позже', command=lambda: root.destroy() if not state['busy'] else None).pack(side='left')
     apply = ttk.Button(row, text='Обновить', command=lambda: work(True), state='disabled')
     apply.pack(side='right')
     root.protocol('WM_DELETE_WINDOW', lambda: None if state['busy'] else root.destroy())
@@ -222,4 +241,12 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    import win32api
+    import win32event
+    import winerror
+    mutex = win32event.CreateMutex(None, False, 'Local\\SkladCorelDXFUpdater')
+    try:
+        if win32api.GetLastError() != winerror.ERROR_ALREADY_EXISTS:
+            main()
+    finally:
+        win32api.CloseHandle(mutex)

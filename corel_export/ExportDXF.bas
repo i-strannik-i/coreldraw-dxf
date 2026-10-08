@@ -38,16 +38,19 @@ Private Function ExportBusy() As Boolean
 End Function
 
 Public Sub ShowExporter()
+    AutoCheckUpdates
     If Application.Documents.Count = 0 Then Exit Sub
     If ExportBusy() Then Exit Sub
     DXFOptions.Show
 End Sub
 
 Public Sub ShowLayerHelp()
+    AutoCheckUpdates
     LayerHelp.Show
 End Sub
 
 Public Sub ShowHotkeys()
+    AutoCheckUpdates
     On Error GoTo Failed
     Dim engine As String
     engine = Application.GMSManager.UserGMSPath & "SkladCorelDXF_runtime\HotkeySettings.exe"
@@ -56,6 +59,15 @@ Public Sub ShowHotkeys()
     Exit Sub
 Failed:
     MsgBox Err.Description, vbExclamation, "DXF"
+End Sub
+
+Public Sub AutoCheckUpdates()
+    On Error Resume Next
+    Dim engine As String
+    engine = Application.GMSManager.UserGMSPath & "SkladCorelDXF_runtime\UpdateCorelDXF.exe"
+    If Dir$(engine) <> "" Then
+        CreateObject("WScript.Shell").Run Chr$(34) & engine & Chr$(34) & " --auto", 0, False
+    End If
 End Sub
 
 Public Sub ShowUpdates()
@@ -69,6 +81,7 @@ Public Sub ShowUpdates()
 End Sub
 
 Private Sub LaunchVectorTools(ByVal mode As String)
+    AutoCheckUpdates
     Dim engine As String
     engine = Application.GMSManager.UserGMSPath & "SkladCorelDXF_runtime\VectorTools.exe"
     If Dir$(engine) = "" Then

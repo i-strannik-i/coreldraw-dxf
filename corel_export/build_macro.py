@@ -60,7 +60,7 @@ def build(destination):
         ('Forms.OptionButton.1', 'WholePage', 'Весь текущий лист', 14, 67, 315, 22),
         ('Forms.Label.1', 'hint', 'Слои и цвета • Масштаб 1:1 • Допуск 0,1 мм', 14, 102, 320, 18),
         ('Forms.Label.1', 'path', 'DXF рядом с CDR. Существующий DXF получит резервную копию.', 14, 126, 320, 30),
-        ('Forms.Label.1', 'CheckHint', 'Проверка и соединение — отдельные кнопки панели.', 14, 159, 174, 33),
+        ('Forms.Label.1', 'CheckHint', 'Соединение и замыкание — в окне «Проверить».', 14, 159, 174, 33),
         ('Forms.CommandButton.1', 'UpdateButton', 'Обновления', 199, 162, 130, 26),
         ('Forms.CommandButton.1', 'ExportButton', 'Экспортировать', 105, 200, 130, 26),
         ('Forms.CommandButton.1', 'CancelButton', 'Отмена', 245, 200, 84, 26),

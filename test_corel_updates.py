@@ -8,6 +8,20 @@ from corel_export import update_manager as u
 
 
 class UpdateTests(unittest.TestCase):
+    def test_automatic_check_is_silent_offline(self):
+        with patch.object(u,'check_latest',side_effect=OSError('offline')):
+            self.assertIsNone(u.automatic_release('unused'))
+
+    def test_automatic_check_is_silent_when_current(self):
+        with patch.object(u,'check_latest',return_value={'available':False}):
+            self.assertIsNone(u.automatic_release('unused'))
+
+    def test_automatic_check_offers_newer_release(self):
+        release={'available':True,'version':'9.0.0'}
+        with patch.object(u,'check_latest',return_value=release), patch.object(u.subprocess,'Popen') as launch:
+            self.assertEqual(u.automatic_release('unused'),release)
+            launch.assert_not_called()
+
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
