@@ -218,6 +218,9 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
                                 colors.add(text_color)
                                 layer_info['entities'] += 1
                                 shape_dxf = False
+                                # Standalone DXF already contains editable text; no glyph outlines are needed.
+                                if connected:
+                                    continue
                             if shape.Type == 6:
                                 report['text_objects_outlined'] += 1
                             if shape.Type != 3:
