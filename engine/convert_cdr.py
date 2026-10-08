@@ -248,7 +248,7 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
                                 else:
                                     report['validation']['open_allowed'] += 1
                                 for kind, points in original_segments:
-                                    if all(math.dist(points[0], p) <= 1e-9 for p in points):
+                                    if shape_dxf and all(math.dist(points[0], p) <= 1e-9 for p in points):
                                         report['validation']['zero_length'].append({'layer': name, 'contour': contour_count})
                                 timings['read_geometry'] += time.monotonic() - phase_started
                                 segment_count += len(original_segments)

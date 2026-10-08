@@ -41,7 +41,7 @@ def export_request(request, target, progress):
         layers = ', '.join(sorted({item['layer'] for item in issues}))
         raise ValueError(f'Проверка контуров: незамкнутых для резки/выборки — {len(issues)} ({layers}); '
                          f'нулевых участков — {len(validation.get("zero_length", []))}. '
-                         'DXF не заменён. Нажмите «Проверить контуры» в плагине. Допуск 0,1 мм не замыкает исходные контуры автоматически.')
+                         'DXF не заменён. Нажмите «Проверить» на панели плагина. Допуск 0,1 мм не замыкает исходные контуры автоматически.')
     progress('Сохранение DXF')
     report['backup'] = publish_file(report['dxf'], target)
     report.update(saved_dxf=str(target), scope=scope)
@@ -73,8 +73,11 @@ def main():
                 return
             target = Path(choice)
         root.title('CorelDRAW → DXF')
-        root.geometry('610x270')
-        root.resizable(False, False)
+        root.geometry('740x460')
+        root.minsize(640,400)
+        root.resizable(True, True)
+        footer = ttk.Frame(root, padding=(18,8,18,16))
+        footer.pack(side='bottom',fill='x')
         frame = ttk.Frame(root, padding=18)
         frame.pack(fill='both', expand=True)
         ttk.Label(frame, text=target.name, font=('Segoe UI', 11, 'bold'), wraplength=565).pack(anchor='w')
@@ -87,7 +90,16 @@ def main():
         bar = ttk.Progressbar(frame, mode='indeterminate')
         bar.pack(fill='x', pady=12)
         bar.start(20)
-        ttk.Label(frame, textvariable=detail, wraplength=565).pack(anchor='w')
+        detail_area=ttk.Frame(frame);detail_area.pack(fill='both',expand=True)
+        detail_text=tk.Text(detail_area,height=7,wrap='word',font=('Segoe UI',10),
+                            relief='solid',borderwidth=1,padx=10,pady=8,state='disabled')
+        scroll=ttk.Scrollbar(detail_area,orient='vertical',command=detail_text.yview)
+        scroll.pack(side='right',fill='y');detail_text.pack(side='left',fill='both',expand=True)
+        detail_text.configure(yscrollcommand=scroll.set)
+        def render_detail(*args):
+            detail_text.configure(state='normal');detail_text.delete('1.0','end')
+            detail_text.insert('1.0',detail.get());detail_text.configure(state='disabled')
+        detail.trace_add('write',render_detail)
         ttk.Label(frame, textvariable=clock).pack(anchor='w', pady=5)
         events = queue.Queue()
         cancel = threading.Event()
@@ -102,8 +114,14 @@ def main():
             button.configure(state='disabled')
             stage.set('Отмена: ожидаю завершения текущей операции CorelDRAW…')
 
-        button = ttk.Button(frame, text='Отменить', command=stop)
-        button.pack(anchor='e')
+        def open_log():
+            path=request.parent/'error.txt'
+            try:os.startfile(str(path if path.is_file() else request.parent))
+            except OSError as error:messagebox.showerror('Журнал экспорта',str(error),parent=root)
+        log_button=ttk.Button(footer,text='Открыть журнал',command=open_log,state='disabled')
+        log_button.pack(side='left')
+        button = ttk.Button(footer, text='Отменить', command=stop,width=16)
+        button.pack(side='right')
         root.protocol('WM_DELETE_WINDOW', stop)
 
         def worker():
@@ -140,6 +158,7 @@ def main():
                     state['finished'] = True
                     bar.stop()
                     button.configure(text='Закрыть', state='normal')
+                    log_button.configure(state='normal')
                     if kind == 'done':
                         stage.set('DXF сохранён')
                         detail.set(str(target))
@@ -149,7 +168,7 @@ def main():
                         root.after(1500, root.destroy)
                     else:
                         stage.set('Не удалось экспортировать. Исходный CDR не изменён.')
-                        detail.set(data[:240] + '\nЖурнал: ' + str(request.parent / 'error.txt'))
+                        detail.set(data + '\n\nЖурнал: ' + str(request.parent / 'error.txt'))
                     return
             seconds = int(time.monotonic() - started)
             clock.set(f'Прошло {seconds // 60:02d}:{seconds % 60:02d}')
