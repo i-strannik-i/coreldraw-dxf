@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+corel_export/build/
+corel_export/dist/
+corel_export/package/
+*.spec
+*.exe
+*.zip
+corel_export/CorelDXF-latest.json

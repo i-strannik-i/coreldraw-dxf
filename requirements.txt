@@ -1,0 +1,7 @@
+ezdxf
+numpy
+pywin32
+Pillow
+pyinstaller
+fonttools
+typing_extensions
