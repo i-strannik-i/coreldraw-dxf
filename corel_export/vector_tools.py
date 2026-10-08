@@ -217,19 +217,28 @@ def main():
         ttk.Button(frame,text='Предпросмотр',command=lambda:safe(preview)).pack(side='left',pady=14)
         apply=ttk.Button(frame,text='Соединить',command=lambda:safe(join),state='disabled');apply.pack(side='left',padx=8)
     else:
+        root.geometry('1080x680');root.minsize(1000,620)
+        body=ttk.Frame(frame);body.pack(fill='both',expand=True,pady=(8,0))
+        layer_box=ttk.LabelFrame(body,text='Слои для проверки',padding=10)
+        layer_box.pack(side='left',fill='y',padx=(0,16))
+        frame=ttk.Frame(body);frame.pack(side='left',fill='both',expand=True)
         selected=tk.BooleanVar(value=bool(session.app.ActiveSelectionRange.Count))
         scope=ttk.Checkbutton(frame,text='Только выделенные (иначе видимые объекты текущей страницы)',variable=selected)
         scope.pack(anchor='w')
-        layer_box=ttk.LabelFrame(frame,text='Какие слои проверять',padding=6)
-        layer_box.pack(fill='x',pady=6)
         layer_row=ttk.Frame(layer_box);layer_row.pack(fill='x')
-        layer_canvas=tk.Canvas(layer_box,height=85,highlightthickness=0)
-        layer_scroll=ttk.Scrollbar(layer_box,orient='vertical',command=layer_canvas.yview)
-        layer_scroll.pack(side='right',fill='y');layer_canvas.pack(fill='x',expand=True)
+        layer_count=tk.StringVar()
+        ttk.Label(layer_box,textvariable=layer_count).pack(anchor='w',pady=(10,8))
+        ttk.Label(layer_box,text='Скрытые слои, INFO\nи служебные метки исключены.',wraplength=210).pack(side='bottom',anchor='w',pady=(10,0))
+        layer_area=ttk.Frame(layer_box);layer_area.pack(fill='both',expand=True)
+        layer_canvas=tk.Canvas(layer_area,width=210,highlightthickness=0)
+        layer_scroll=ttk.Scrollbar(layer_area,orient='vertical',command=layer_canvas.yview)
+        layer_scroll.pack(side='right',fill='y');layer_canvas.pack(side='left',fill='both',expand=True)
         layer_canvas.configure(yscrollcommand=layer_scroll.set)
         layer_list=ttk.Frame(layer_canvas)
         layer_canvas.create_window((0,0),window=layer_list,anchor='nw')
         layer_list.bind('<Configure>',lambda event:layer_canvas.configure(scrollregion=layer_canvas.bbox('all')))
+        def wheel(event):layer_canvas.yview_scroll(-int(event.delta/120),'units')
+        layer_canvas.bind('<MouseWheel>',wheel);layer_list.bind('<MouseWheel>',wheel)
         layer_vars={};layer_controls=[]
         for layer in session.page.Layers:
             name=layer.Name
@@ -237,12 +246,13 @@ def main():
             if name in layer_vars:continue
             value=tk.BooleanVar(value=True);layer_vars[name]=value
             button=ttk.Checkbutton(layer_list,text=name,variable=value)
-            index=len(layer_controls);button.grid(row=index//2,column=index%2,sticky='w',padx=(0,24),pady=2)
+            index=len(layer_controls);button.grid(row=index,column=0,sticky='w',padx=(0,8),pady=6)
+            button.bind('<MouseWheel>',wheel)
             layer_controls.append(button)
         for caption,value in [('Выбрать все',True),('Снять все',False)]:
             button=ttk.Button(layer_row,text=caption,command=lambda value=value:[v.set(value) for v in layer_vars.values()])
             button.pack(side='left',padx=(0,6));layer_controls.append(button)
-        ttk.Label(layer_row,text='Скрытые слои, INFO и метки исключены.').pack(side='left',padx=8)
+        layer_count.set(f'Выбрано: {len(layer_vars)} из {len(layer_vars)}')
         settings=ttk.Frame(frame);settings.pack(fill='x',pady=8)
         ttk.Label(settings,text='Допуск проверки кривых, мм:').pack(side='left')
         tolerance=tk.StringVar(value='0,1')
@@ -349,6 +359,7 @@ def main():
         cancel=ttk.Button(row,text='Отменить проверку',command=cancel_event.set,state='disabled');cancel.pack(side='right')
         def invalidate(*args):
             if state['busy']:return
+            layer_count.set(f'Выбрано: {sum(v.get() for v in layer_vars.values())} из {len(layer_vars)}')
             state['issues']=[];tree.delete(*tree.get_children());marks.configure(state='disabled')
             progress['value']=0;status.set('Параметры изменены. Нажмите «Проверить».')
         for variable in (*layer_vars.values(),tolerance,selected):variable.trace_add('write',invalidate)
