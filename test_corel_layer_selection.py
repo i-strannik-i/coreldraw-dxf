@@ -1,9 +1,47 @@
 import unittest
 from types import SimpleNamespace
-from corel_export.vector_tools import CorelSession
+from corel_export.vector_tools import CorelSession, excluded_layer, ISSUE_STYLES, draw_issue_symbol
 
 
 class LayerSelectionTests(unittest.TestCase):
+    def test_complete_check_replaces_marks_even_if_empty(self):
+        from unittest.mock import Mock
+        session=CorelSession.__new__(CorelSession);session.mark=Mock()
+        self.assertTrue(session.refresh_marks(dict(complete=True,issues=[])))
+        session.mark.assert_called_once_with([],None)
+
+    def test_incomplete_check_preserves_marks(self):
+        from unittest.mock import Mock
+        session=CorelSession.__new__(CorelSession);session.mark=Mock()
+        self.assertFalse(session.refresh_marks(dict(complete=False,issues=[])))
+        session.mark.assert_not_called()
+
+    def test_cancelled_check_preserves_marks(self):
+        from unittest.mock import Mock
+        session=CorelSession.__new__(CorelSession);session.mark=Mock()
+        with self.assertRaises(InterruptedError):
+            session.refresh_marks(dict(complete=True,issues=[]),lambda:True)
+        session.mark.assert_not_called()
+
+    def test_technical_layer_filter(self):
+        for name in ['Guides',' INFO ','Desktop','Document Grid','Направляющие','_DXF_CHECK_abc']:
+            self.assertTrue(excluded_layer(name),name)
+        for name in ['D4','CUT_OUT','P4_1,5mm','Layer 1','Guide design']:
+            self.assertFalse(excluded_layer(name),name)
+
+    def test_technical_geometry_is_not_read(self):
+        session=self.make_session()
+        session.page.Shapes[0].Layer.Name='Guides'
+        contours,_=session.snapshot(False)
+        self.assertEqual([c['layer'] for c in contours],['CUT_OUT'])
+
+    def test_legend_draws_all_kinds(self):
+        from unittest.mock import Mock
+        for kind,style in ISSUE_STYLES.items():
+            canvas=Mock()
+            draw_issue_symbol(canvas,kind,style[2])
+            self.assertTrue(canvas.mock_calls)
+
     def make_session(self):
         shapes=[SimpleNamespace(Layer=SimpleNamespace(Name=name,Visible=True),
                                 Type=3,PowerClip=None,StaticID=index)

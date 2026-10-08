@@ -16,6 +16,42 @@ from corel_geometry import decode_subpath
 from vector_audit import audit, ambiguous_endpoints
 
 MARK_PREFIX = '_DXF_CHECK_'
+ISSUE_STYLES = {
+    'zero': ('Нулевой участок', 'Узел без длины', '#007e99'),
+    'overlap': ('Наложение', 'Совпадающие участки', '#8741af'),
+    'intersection': ('Пересечение / касание', 'Векторы встречаются', '#c5363d'),
+    'open': ('Открытый контур', 'Концы не соединены', '#a85b00'),
+}
+
+
+def excluded_layer(name):
+    name=name.strip().upper()
+    return name.startswith(MARK_PREFIX) or name in {
+        'INFO','GUIDES','GUIDELINES','DESKTOP','DOCUMENT GRID','GRID',
+        'НАПРАВЛЯЮЩИЕ','РАБОЧИЙ СТОЛ','СЕТКА ДОКУМЕНТА','СЕТКА',
+    }
+
+
+def draw_issue_symbol(canvas, kind, color):
+    line='#73818d'
+    if kind=='zero':
+        canvas.create_line(9,9,36,36,fill=line,width=2)
+        canvas.create_rectangle(19,19,27,27,fill=color,outline=color)
+        canvas.create_oval(13,13,33,33,outline=color,width=2)
+    elif kind=='overlap':
+        canvas.create_rectangle(7,8,29,29,outline=line,width=2)
+        canvas.create_rectangle(20,20,42,41,outline=line,width=2)
+        canvas.create_line(20,29,29,29,29,20,fill=color,width=4)
+    elif kind=='intersection':
+        canvas.create_line(7,9,41,39,fill=line,width=2)
+        canvas.create_line(7,39,41,9,fill=line,width=2)
+        canvas.create_oval(17,17,31,31,outline=color,width=3)
+        canvas.create_line(24,13,24,35,fill=color,width=1)
+        canvas.create_line(13,24,35,24,fill=color,width=1)
+    elif kind=='open':
+        canvas.create_line(18,9,8,9,8,39,40,39,40,9,30,9,fill=line,width=2)
+        for x in (18,30):canvas.create_oval(x-3,6,x+3,12,fill=color,outline=color)
+        canvas.create_line(21,9,27,9,fill=color,width=2,dash=(2,2))
 
 
 class CorelSession:
@@ -56,7 +92,7 @@ class CorelSession:
         def visit(items):
             for s in items:
                 name = s.Layer.Name
-                if name.startswith(MARK_PREFIX) or name.strip().upper()=='INFO' or not s.Layer.Visible:
+                if excluded_layer(name) or not s.Layer.Visible:
                     continue
                 if s.Type==7:
                     visit(list(s.Shapes));continue
@@ -96,11 +132,13 @@ class CorelSession:
         x,y=issue['point']; width=30/self.scale
         self.doc.ActiveWindow.ActiveView.SetViewArea(x/self.scale-width/2,y/self.scale-width/2,width,width)
 
+    def marker_layers(self):
+        return [l for l in self.page.Layers if re.fullmatch(r'_DXF_CHECK_[0-9a-f]{8}',l.Name)
+                and not l.Printable and l.Shapes.Count>0 and all(s.Name=='DXF_CHECK_MARKER_V1' for s in l.Shapes)]
+
     def clear_marks(self):
         self.current()
-        layers=[l for l in self.page.Layers if re.fullmatch(r'_DXF_CHECK_[0-9a-f]{8}',l.Name)
-                and not l.Printable and l.Shapes.Count>0 and all(s.Name=='DXF_CHECK_MARKER_V1' for s in l.Shapes)]
-        for layer in layers:
+        for layer in self.marker_layers():
             self.doc.BeginCommandGroup('Убрать метки проверки DXF')
             try:
                 layer.Editable=True
@@ -109,17 +147,29 @@ class CorelSession:
             finally:
                 self.doc.EndCommandGroup()
 
-    def mark(self, issues):
+    def refresh_marks(self, result, cancelled=None):
+        if cancelled and cancelled():raise InterruptedError('Проверка отменена. Прежние метки сохранены.')
+        if not result['complete']:return False
+        self.mark(result['issues'],cancelled)
+        return True
+
+    def mark(self, issues, cancelled=None):
         self.unchanged()
-        self.clear_marks()
-        if not issues:return
-        self.doc.BeginCommandGroup('Метки проверки DXF')
+        old_layers=self.marker_layers()
+        if not issues and not old_layers:return
+        def check_cancel():
+            if cancelled and cancelled():raise InterruptedError('Проверка отменена. Прежние метки сохранены.')
+        check_cancel()
+        self.doc.BeginCommandGroup('Обновить метки проверки DXF')
+        changed=False;layer=None
         try:
-            layer=self.page.CreateLayer(MARK_PREFIX+uuid.uuid4().hex[:8])
-            self.mark_layer=layer
-            layer.Printable=False
-            colors={'intersection':(239,55,60),'overlap':(170,40,220),'open':(245,130,20),'zero':(0,160,205)}
+            if issues:
+                layer=self.page.CreateLayer(MARK_PREFIX+uuid.uuid4().hex[:8])
+                changed=True
+                layer.Printable=False
+            colors={kind:tuple(int(style[2][i:i+2],16) for i in (1,3,5)) for kind,style in ISSUE_STYLES.items()}
             for number,issue in enumerate(issues,1):
+                check_cancel()
                 x,y=(v/self.scale for v in issue['point']); radius=1/self.scale
                 circle=layer.CreateEllipse2(x,y,radius,radius)
                 circle.Name='DXF_CHECK_MARKER_V1'
@@ -129,9 +179,19 @@ class CorelSession:
                 text=layer.CreateArtisticText(x+radius,y+radius,str(number))
                 text.Name='DXF_CHECK_MARKER_V1'
                 text.Fill.UniformColor.RGBAssign(*colors[issue['kind']])
-            layer.Editable=False
-        finally:
+            if layer is not None:layer.Editable=False
+            check_cancel()
+            # Replace only after the new set is ready; one Undo restores the old set.
+            for old in old_layers:
+                old.Editable=True;changed=True
+                old.Delete()
+        except Exception:
             self.doc.EndCommandGroup()
+            if changed:self.doc.Undo()
+            raise
+        else:
+            self.doc.EndCommandGroup()
+            self.mark_layer=layer
 
     def prepare_join(self,tolerance):
         if not math.isfinite(tolerance) or not 0<tolerance<=1:
@@ -187,7 +247,7 @@ def main():
     try:session=CorelSession()
     except Exception as error:
         messagebox.showerror('DXF',str(error),parent=root);root.destroy();return
-    status=tk.StringVar(value='Выберите допуск и нажмите «Проверить». Чертёж не изменяется.')
+    status=tk.StringVar(value='Выберите допуск и нажмите «Проверить». Исходные векторы не изменяются.')
     ttk.Label(frame,textvariable=status,wraplength=710).pack(anchor='w',pady=8)
     def safe(action):
         try:action()
@@ -217,7 +277,7 @@ def main():
         ttk.Button(frame,text='Предпросмотр',command=lambda:safe(preview)).pack(side='left',pady=14)
         apply=ttk.Button(frame,text='Соединить',command=lambda:safe(join),state='disabled');apply.pack(side='left',padx=8)
     else:
-        root.geometry('1080x680');root.minsize(1000,620)
+        root.geometry('1080x780');root.minsize(1000,720)
         body=ttk.Frame(frame);body.pack(fill='both',expand=True,pady=(8,0))
         layer_box=ttk.LabelFrame(body,text='Слои для проверки',padding=10)
         layer_box.pack(side='left',fill='y',padx=(0,16))
@@ -228,7 +288,7 @@ def main():
         layer_row=ttk.Frame(layer_box);layer_row.pack(fill='x')
         layer_count=tk.StringVar()
         ttk.Label(layer_box,textvariable=layer_count).pack(anchor='w',pady=(10,8))
-        ttk.Label(layer_box,text='Скрытые слои, INFO\nи служебные метки исключены.',wraplength=210).pack(side='bottom',anchor='w',pady=(10,0))
+        ttk.Label(layer_box,text='Технические и скрытые слои,\nINFO и метки исключены.\nВ CDR ничего не удаляется.',wraplength=210).pack(side='bottom',anchor='w',pady=(10,0))
         layer_area=ttk.Frame(layer_box);layer_area.pack(fill='both',expand=True)
         layer_canvas=tk.Canvas(layer_area,width=210,highlightthickness=0)
         layer_scroll=ttk.Scrollbar(layer_area,orient='vertical',command=layer_canvas.yview)
@@ -242,7 +302,7 @@ def main():
         layer_vars={};layer_controls=[]
         for layer in session.page.Layers:
             name=layer.Name
-            if not layer.Visible or name.startswith(MARK_PREFIX) or name.strip().upper()=='INFO':continue
+            if not layer.Visible or excluded_layer(name):continue
             if name in layer_vars:continue
             value=tk.BooleanVar(value=True);layer_vars[name]=value
             button=ttk.Checkbutton(layer_list,text=name,variable=value)
@@ -259,12 +319,24 @@ def main():
         tolerance_entry=ttk.Entry(settings,textvariable=tolerance,width=10)
         tolerance_entry.pack(side='left',padx=8)
         ttk.Label(frame,text='Каждый слой проверяется отдельно. Между слоями пересечения не ищем.\nДопуск задаёт точность кривых: меньше — точнее, но дольше.\nОткрытые концы отмечаются независимо от допуска; автоматического замыкания нет.\nINFO и служебные метки пропускаются. Найденные места нужно проверить визуально.',wraplength=710).pack(anchor='w',pady=6)
+        legend=ttk.LabelFrame(frame,text='Обозначения проблем',padding=6)
+        legend.pack(fill='x',pady=(2,10))
+        for index,(kind,(title,description,color)) in enumerate(ISSUE_STYLES.items()):
+            card=tk.Frame(legend,bg='#ffffff',padx=6,pady=3)
+            card.grid(row=index//2,column=index%2,sticky='nsew',padx=3,pady=3)
+            legend.columnconfigure(index%2,weight=1)
+            icon=tk.Canvas(card,width=48,height=48,bg='#ffffff',highlightthickness=0)
+            icon.pack(side='left',padx=(0,8));draw_issue_symbol(icon,kind,color)
+            words=tk.Frame(card,bg='#ffffff');words.pack(side='left',fill='x')
+            tk.Label(words,text=title,bg='#ffffff',fg=color,font=('Segoe UI',10,'bold')).pack(anchor='w')
+            tk.Label(words,text=description,bg='#ffffff',fg='#46515c',font=('Segoe UI',9)).pack(anchor='w')
         progress=ttk.Progressbar(frame,maximum=100)
         progress.pack(fill='x',pady=(0,8))
         tree=ttk.Treeview(frame,columns=('type','layer','x','y'),show='headings',height=11)
         for name,title,width in [('type','Проблема',230),('layer','Слой',170),('x','X, мм',100),('y','Y, мм',100)]:
             tree.heading(name,text=title);tree.column(name,width=width)
         tree.pack(fill='both',expand=True)
+        for kind,style in ISSUE_STYLES.items():tree.tag_configure(kind,foreground=style[2])
         messages=queue.Queue();commands=queue.Queue();state={'issues':[],'busy':False}
         cancel_event=threading.Event()
         def background():
@@ -285,6 +357,8 @@ def main():
                             contours,skipped=worker_session.snapshot(only_selected,reading,checked_layers)
                             def report(*args):messages.put(('progress',args))
                             result=audit(contours,tolerance=value,progress=report,cancelled=cancel_event.is_set)
+                            messages.put(('marking',None))
+                            result['marks_updated']=worker_session.refresh_marks(result,cancel_event.is_set)
                             messages.put(('result',(result,skipped,len(contours),value)))
                         else:
                             if command=='focus':worker_session.focus(data)
@@ -338,19 +412,20 @@ def main():
                 elif kind=='reading':
                     layer,count=data
                     status.set(f'Чтение CorelDRAW: слой «{layer}», контур/объект {count+1}…')
+                elif kind=='marking':
+                    status.set('Обновление меток на чертеже… Прежние метки заменяются, а не накапливаются.')
                 elif kind=='action_done':
                     finish();status.set({'focus':'Место выделено и приближено в CorelDRAW.','mark':'Метки добавлены на отдельный непечатный слой.','clear':'Служебные метки удалены.'}[data])
                 elif kind=='error':
                     finish();status.set(data);progress['value']=0
                 elif kind=='result':
                     result,skipped,count,value=data
-                    if cancel_event.is_set():
-                        finish();status.set('Проверка отменена. Частичные результаты не показаны.');continue
                     state['issues']=result['issues']
                     for i,issue in enumerate(result['issues']):
-                        x,y=issue['point'];tree.insert('', 'end',iid=str(i),values=(str(i+1)+'. '+names[issue['kind']]+(' *' if issue['approx'] else ''),issue['layer'],f'{x:.3f}',f'{y:.3f}'))
+                        x,y=issue['point'];tree.insert('', 'end',iid=str(i),tags=(issue['kind'],),values=(str(i+1)+'. '+names[issue['kind']]+(' *' if issue['approx'] else ''),issue['layer'],f'{x:.3f}',f'{y:.3f}'))
                     finish();progress['value']=100 if result['complete'] else 0
                     status.set(f'Проверено контуров: {count}. Допуск: {value:g} мм. Найдено мест: {len(result["issues"])}. Пропущено объектов: {len(skipped)}. '+(('Выберите строку — Corel выделит и приблизит место.' if result['issues'] else 'По проверенным критериям проблем не найдено.') if result['complete'] else 'Достигнут лимит: результат НЕ полный.'))
+                    status.set(status.get()+(' Метки обновлены.' if result['marks_updated'] else ' Прежние метки сохранены.'))
             root.after(150,poll)
         row=ttk.Frame(frame);row.pack(fill='x',pady=10)
         check=ttk.Button(row,text='Проверить',command=lambda:safe(scan));check.pack(side='left')
@@ -364,7 +439,7 @@ def main():
             progress['value']=0;status.set('Параметры изменены. Нажмите «Проверить».')
         for variable in (*layer_vars.values(),tolerance,selected):variable.trace_add('write',invalidate)
         root.protocol('WM_DELETE_WINDOW',lambda:(cancel_event.set(),commands.put(('stop',None)),root.destroy()))
-        ttk.Label(frame,text='Метки — отдельный непечатный слой; в DXF не экспортируются. Сохранение CDR — вручную.',wraplength=710).pack(anchor='w')
+        ttk.Label(frame,text='Метки обновляются после полной проверки. Отмена изменения: Ctrl+Z.\nМетки не печатаются и не входят в DXF. Сохранение CDR — вручную.',wraplength=710).pack(anchor='w')
         poll()
     root.mainloop()
 
