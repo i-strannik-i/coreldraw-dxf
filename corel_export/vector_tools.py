@@ -25,6 +25,22 @@ ISSUE_STYLES = {
 }
 
 
+def check_summary(result, count, skipped, tolerance, selected, layers):
+    if not result['complete']:
+        outcome='Проверка НЕ завершена. Отсутствие ошибок не подтверждено.'
+    elif not count:
+        outcome='Нет контуров для проверки. Отсутствие ошибок не подтверждено.'
+    elif skipped:
+        outcome='Проверка выполнена с пропусками. Не все объекты проверены.'
+    elif result['issues']:
+        outcome=f'Проверка завершена. Найдено проблем: {len(result["issues"])}.'
+    else:
+        outcome='Проверка завершена. Ошибок и предупреждений не найдено.'
+    scope='Только выделенные объекты' if selected else 'Видимые объекты текущей страницы'
+    return (outcome+f'\nКонтуров: {count}; пропущено объектов: {len(skipped)}; допуск: {tolerance:g} мм.'+
+            '\n'+scope+'; слои: '+', '.join(sorted(layers))+'.')
+
+
 def excluded_layer(name):
     name=name.strip().upper()
     return name.startswith(MARK_PREFIX) or name in {
@@ -250,9 +266,11 @@ def main():
     try:
         from .ui_shell import apply_theme, load_theme, save_theme, feedback, THEMES
         from .version import VERSION
+        from .export_panel import ExportPanel
     except ImportError:
         from ui_shell import apply_theme, load_theme, save_theme, feedback, THEMES
         from version import VERSION
+        from export_panel import ExportPanel
     root=tk.Tk(); root.title('CorelDRAW → DXF · '+VERSION+' beta')
     root.geometry('790x780');root.minsize(750,720)
     frame=ttk.Frame(root,padding=16);frame.pack(fill='both',expand=True)
@@ -281,24 +299,28 @@ def main():
         except Exception as error:messagebox.showerror('DXF',str(error),parent=root)
     def macro(name):
         session.app.GMSManager.RunMacro('SkladCorelDXF','ExportDXF.'+name)
-    ttk.Label(export_tab,text='Сохранить чертёж в DXF',style='Title.TLabel').pack(anchor='w',pady=(4,16))
+    ttk.Label(export_tab,text='Сохранить чертёж в DXF',style='Title.TLabel').pack(anchor='w',pady=(0,8))
     export_scope=tk.StringVar(value='selection' if session.app.ActiveSelectionRange.Count else 'page')
-    ttk.Radiobutton(export_tab,text='Выделенные объекты',variable=export_scope,value='selection').pack(anchor='w',pady=6)
-    ttk.Radiobutton(export_tab,text='Весь текущий лист',variable=export_scope,value='page').pack(anchor='w',pady=6)
-    ttk.Separator(export_tab).pack(fill='x',pady=20)
+    scope_row=ttk.Frame(export_tab);scope_row.pack(fill='x',pady=6)
+    export_options=[]
+    for caption,value in [('Выделенные объекты','selection'),('Весь текущий лист','page')]:
+        option=ttk.Radiobutton(scope_row,text=caption,variable=export_scope,value=value)
+        option.pack(side='left',padx=(0,20));export_options.append(option)
     ttk.Label(export_tab,text='Масштаб 1:1   ·   Миллиметры   ·   Допуск оптимизации 0,1 мм').pack(anchor='w')
-    ttk.Label(export_tab,text='DXF сохраняется рядом с CDR под тем же именем.\nСуществующий DXF получит резервную копию.\nПересечения и наложения требуют подтверждения.\nОткрытые контуры не замыкаются автоматически.',style='Muted.TLabel').pack(anchor='w',pady=16)
+    ttk.Label(export_tab,text='DXF рядом с CDR. Существующий файл получит резервную копию.\nОткрытые контуры сохраняются без автоматического замыкания.',style='Muted.TLabel').pack(anchor='w',pady=8)
     export_path=tk.StringVar(value=str(session.doc.FullFileName or 'Несохранённый документ: папку предложим выбрать при экспорте.'))
-    ttk.Label(export_tab,textvariable=export_path,wraplength=820).pack(anchor='w',pady=(0,20))
-    def begin_export():
-        if state['busy']:return
+    ttk.Label(export_tab,textvariable=export_path,wraplength=820).pack(anchor='w',pady=(0,4))
+    def prepare_export():
+        if state['busy']:raise ValueError('Дождитесь завершения проверки или соединения векторов.')
         session.current()
         if export_scope.get()=='selection' and not session.app.ActiveSelectionRange.Count:
             raise ValueError('Сначала выделите объекты в CorelDRAW.')
-        status.set('Подготовка экспорта. Ход операции появится в окне журнала.')
-        session.app.GMSManager.RunMacro('SkladCorelDXF','ExportDXF.RunExport',export_scope.get()=='selection')
-    ttk.Button(export_tab,text='Экспортировать DXF',style='Accent.TButton',command=lambda:safe(begin_export)).pack(anchor='w')
-    ttk.Button(export_tab,text='Проверить векторы перед экспортом',command=lambda:notebook.select(check_tab)).pack(anchor='w',pady=12)
+        return session.app.GMSManager.RunMacro('SkladCorelDXF','ExportDXF.PrepareExport',export_scope.get()=='selection')
+    def export_busy(busy):
+        notebook.tab(check_tab,state='disabled' if busy else 'normal')
+        for option in export_options:option.configure(state='disabled' if busy else 'normal')
+        status.set('Выполняется экспорт. Не редактируйте чертёж до завершения операции.' if busy else 'Готово. Итог экспорта и журнал находятся во вкладке «Экспорт».')
+    exporter=ExportPanel(export_tab,prepare_export,export_busy,lambda:notebook.select(check_tab))
     ttk.Label(help_tab,text='Памятка по слоям',style='Title.TLabel').pack(anchor='w',pady=(0,12))
     rows=[('INFO','Информационный текст. Без резки и гравировки.'),('#','Артикулы: гравировка на глубину 0,1 мм.'),
           ('CUT_OUT','Сквозной рез снаружи контура.'),('CUT_IN','Сквозной рез внутри контура.'),('CUT_ON','Рез по линии контура.'),
@@ -401,6 +423,25 @@ def main():
             filter_buttons[kind]=control
         progress=ttk.Progressbar(frame,maximum=100)
         progress.pack(fill='x',pady=(0,8))
+        check_log=ttk.LabelFrame(frame,text='Журнал проверки',padding=4)
+        check_log.pack(fill='x',pady=(0,4))
+        check_result=tk.StringVar(value='Проверка ещё не выполнена.')
+        history=[]
+        def record_check(message):
+            entry=time.strftime('[%H:%M:%S] ')+message
+            history.append(entry)
+            check_result.set(entry)
+        def show_check_log():
+            window=tk.Toplevel(root);window.title('Журнал проверок');window.geometry('780x420')
+            from tkinter.scrolledtext import ScrolledText
+            palette=ttk.Style(root)
+            view=ScrolledText(window,wrap='word',font=('Segoe UI',10),
+                background=palette.lookup('TFrame','background'),foreground=palette.lookup('TLabel','foreground'))
+            view.pack(fill='both',expand=True,padx=10,pady=10)
+            view.insert('1.0','\n\n'.join(history) or 'Проверка ещё не выполнена.')
+            view.configure(state='disabled')
+        ttk.Button(check_log,text='История',command=show_check_log).pack(side='right',padx=(8,0))
+        ttk.Label(check_log,textvariable=check_result,wraplength=600).pack(side='left',fill='x',expand=True)
         tree=ttk.Treeview(frame,columns=('type','layer','x','y'),show='headings',height=6)
         for name,title,width in [('type','Проблема',230),('layer','Слой',170),('x','X, мм',100),('y','Y, мм',100)]:
             tree.heading(name,text=title);tree.column(name,width=width)
@@ -466,7 +507,7 @@ def main():
         threading.Thread(target=background,daemon=True).start()
         names={'intersection':'Пересечение/касание','overlap':'Наложение','open':'Открытый конец','zero':'Нулевой участок'}
         def scan(update_marks=True):
-            if state['busy']:return
+            if state['busy'] or exporter.busy:return
             try:value=float(tolerance.get().replace(',','.'))
             except ValueError:raise ValueError('Введите допуск числом, например 0,1 мм.')
             if not math.isfinite(value) or not .001<=value<=1:
@@ -474,6 +515,9 @@ def main():
             checked_layers={name for name,var in layer_vars.items() if var.get()}
             if not checked_layers:raise ValueError('Отметьте хотя бы один слой для проверки.')
             state['issues']=[]; render_issues()
+            state['scan_scope']=(selected.get(),set(checked_layers))
+            state['scanning']=True
+            record_check('Проверка выполняется. Итог ещё не получен.')
             state['busy']=True;cancel_event.clear()
             join_apply.configure(state='disabled');join_refresh.configure(state='disabled');join_entry.configure(state='disabled')
             for control in (check,marks,clear,scope,tolerance_entry,*layer_controls):control.configure(state='disabled')
@@ -487,7 +531,7 @@ def main():
             cancel.configure(state='disabled')
             join_refresh.configure(state='normal');join_entry.configure(state='normal')
         def action(command,data=None):
-            if state['busy']:return
+            if state['busy'] or exporter.busy:return
             state['busy']=True
             join_apply.configure(state='disabled');join_refresh.configure(state='disabled');join_entry.configure(state='disabled')
             for control in (check,marks,clear,scope,tolerance_entry,*layer_controls):control.configure(state='disabled')
@@ -516,6 +560,8 @@ def main():
                     finish();status.set({'focus':'Место выделено и приближено в CorelDRAW.','mark':'Метки добавлены на отдельный непечатный слой.','clear':'Служебные метки удалены.'}[data])
                 elif kind=='error':
                     finish();status.set(data);progress['value']=0
+                    if state.pop('scanning',False):
+                        record_check('Проверка НЕ завершена. '+data+' Отсутствие ошибок не подтверждено.')
                     join_apply.configure(state='disabled')
                 elif kind=='join_preview':
                     revision,before,after,error=data
@@ -536,6 +582,8 @@ def main():
                     safe(lambda:scan(False))
                 elif kind=='result':
                     result,skipped,count,value=data
+                    state['scanning']=False
+                    record_check(check_summary(result,count,skipped,value,*state['scan_scope']))
                     state['issues']=result['issues']
                     render_issues()
                     finish();progress['value']=100 if result['complete'] else 0
@@ -550,7 +598,7 @@ def main():
         join_state={'revision':0,'ready':None,'timer':None}
         def preview_join():
             join_state['timer']=None
-            if state['busy']:
+            if state['busy'] or exporter.busy:
                 join_state['timer']=root.after(400,preview_join)
                 return
             try:
@@ -578,13 +626,22 @@ def main():
             layer_count.set(f'Выбрано: {sum(v.get() for v in layer_vars.values())} из {len(layer_vars)}')
             state['issues']=[];render_issues();marks.configure(state='disabled')
             progress['value']=0;status.set('Параметры изменены. Нажмите «Проверить».')
+            check_result.set('Параметры изменены. Нужна новая проверка. Предыдущие итоги доступны в истории.')
         for variable in (*layer_vars.values(),tolerance,selected):variable.trace_add('write',invalidate)
-        root.protocol('WM_DELETE_WINDOW',lambda:(cancel_event.set(),commands.put(('stop',None)),root.destroy()))
+        closing=[False]
+        def close_window():
+            if exporter.busy:
+                if not closing[0]:exporter.cancel();closing[0]=True
+                root.after(100,close_window)
+                return
+            cancel_event.set();commands.put(('stop',None));root.destroy()
+        root.protocol('WM_DELETE_WINDOW',close_window)
         ttk.Label(frame,text='Метки не печатаются и не входят в DXF. Сохранение CDR — вручную.',style='Muted.TLabel',wraplength=710).pack(side='bottom',anchor='w',before=tree)
         poll()
         def refresh_theme(event=None):
             name='dark' if theme_value.get()=='Тёмная' else 'light'
             apply_theme(root,name,tree,layer_canvas)
+            exporter.theme()
             try:save_theme(name)
             except OSError:status.set('Не удалось сохранить тему. В текущем окне она применена.')
         theme_picker.bind('<<ComboboxSelected>>',refresh_theme)
@@ -599,7 +656,7 @@ def main():
                     data=json.loads(request.read_text(encoding='utf-8'))
                     tab={'export':export_tab,'check':check_tab,'help':help_tab}.get(data.get('tab'))
                     if tab is not None and abs(time.time()-data.get('created',0))<10:
-                        notebook.select(tab);root.deiconify();root.lift()
+                        notebook.select(export_tab if exporter.busy else tab);root.deiconify();root.lift()
             except (OSError,ValueError,TypeError):pass
             root.after(350,switch_requested_tab)
         switch_requested_tab()

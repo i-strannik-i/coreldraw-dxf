@@ -125,13 +125,24 @@ End Sub
 Public Sub RunExport(ByVal SelectionOnly As Boolean)
     On Error GoTo Failed
     If ExportBusy() Then Exit Sub
+    Dim request As String, engine As String
+    request = PrepareExport(SelectionOnly)
+    engine = Application.GMSManager.UserGMSPath & "SkladCorelDXF_runtime\CorelDXF.exe"
+    CreateObject("WScript.Shell").Run Chr$(34) & engine & Chr$(34) & " " & Chr$(34) & request & Chr$(34), 1, False
+    Exit Sub
+Failed:
+    MsgBox Err.Description, vbExclamation, "CorelDRAW -> DXF"
+End Sub
+
+Public Function PrepareExport(ByVal SelectionOnly As Boolean) As String
+    On Error GoTo Failed
     Dim doc As Document, opt As StructSaveAsOptions
     Dim fs As Object, stream As Object, shell As Object
     Dim root As String, job As String, target As String, engine As String
     Dim pageNumber As Long, selection As ShapeRange, pageShapes As ShapeRange
     Dim failure As String, master As Layer
     Set doc = ActiveDocument
-    If SelectionOnly And ActiveSelectionRange.Count = 0 Then Exit Sub
+    If SelectionOnly And ActiveSelectionRange.Count = 0 Then Err.Raise 513, , "No selected objects."
     Set fs = CreateObject("Scripting.FileSystemObject")
     Set shell = CreateObject("WScript.Shell")
     root = shell.ExpandEnvironmentStrings("%TEMP%") & "\SkladCorelDXF"
@@ -171,10 +182,9 @@ Public Sub RunExport(ByVal SelectionOnly As Boolean)
         stream.WriteLine "1"
     End If
     stream.Close
-    Set shell = CreateObject("WScript.Shell")
-    ' Return immediately so the external converter can call Corel through COM.
-    shell.Run Chr$(34) & engine & Chr$(34) & " " & Chr$(34) & job & "\request.txt" & Chr$(34), 1, False
-    Exit Sub
+    ' The caller owns conversion, progress, cancellation and snapshot cleanup.
+    PrepareExport = job & "\request.txt"
+    Exit Function
 Failed:
     failure = Err.Description
     On Error Resume Next
@@ -182,5 +192,7 @@ Failed:
         doc.Pages(pageNumber).Activate
         selection.CreateSelection
     End If
-    MsgBox failure, vbExclamation, "CorelDRAW -> DXF"
-End Sub
+    If Len(job) > 0 Then fs.DeleteFile job & "\snapshot.cdr", True
+    On Error GoTo 0
+    Err.Raise 513, "PrepareExport", failure
+End Function
