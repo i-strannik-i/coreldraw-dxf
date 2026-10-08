@@ -45,7 +45,7 @@ class InstallerTests(unittest.TestCase):
             panel = root.find(f'.//commandBarData[@guid="{BAR}"]/toolbar')
             self.assertIsNotNone(panel)
             self.assertEqual(panel.get('itemFace'), 'textRightOfImage')
-            self.assertEqual([item.get('guidRef') for item in panel], [EXPORT, CHECK, JOIN, HELP])
+            self.assertEqual([item.get('guidRef') for item in panel], [EXPORT, CHECK, HELP])
             self.assertTrue(all(item.get('itemFace') == 'textRightOfImage' for item in panel))
             self.assertEqual(len(root.findall(f'.//toolbar[@guidRef="{BAR}"]')), 1)
             standard = root.find(f'.//commandBarData[@guid="{STANDARD}"]/toolbar')

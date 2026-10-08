@@ -86,7 +86,7 @@ def add_text_entity(drawing, shape, scale, layer, color):
     font = str(story.Font)
     size = abs(float(story.Size))
     if not text or not math.isfinite(size) or size <= 0:
-        raise ValueError('Cannot export text with undefined font size on '+layer)
+        raise ValueError('Не удалось определить размер шрифта текста на слое '+layer)
     angle = float(shape.RotationAngle)
     cx,cy = float(shape.CenterX),float(shape.CenterY)
     # Measure the text frame without rotation on a disposable duplicate.
@@ -114,7 +114,7 @@ def add_text_entity(drawing, shape, scale, layer, color):
             'layer':layer,'insert_mm':insertion}
 
 
-def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0, *, page_index=None, connected=False):
+def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0, *, page_index=None, connected=False, check_vectors=False):
     progress = progress or (lambda stage, **details: None)
     started = time.monotonic()
     progress('Чтение исходного CDR')
@@ -123,12 +123,12 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
     import win32com.client
     source = Path(source).resolve(strict=True)
     if source.suffix.lower() != '.cdr':
-        raise ValueError('Select a CDR file.')
+        raise ValueError('Выберите файл CDR.')
     original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
     if not math.isfinite(tolerance) or tolerance < 0:
-        raise ValueError('Tolerance must be a finite non-negative number.')
+        raise ValueError('Допуск должен быть конечным числом не меньше нуля.')
     if not math.isfinite(optimize_tolerance) or optimize_tolerance < 0:
-        raise ValueError('Invalid optimization tolerance')
+        raise ValueError('Некорректный допуск оптимизации.')
     from optimize_curves import optimize
     from corel_geometry import decode_subpath
     from contour_dxf import polyline_vertices, requires_closed
@@ -157,6 +157,7 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
     drawing.header['$MEASUREMENT'] = 1
     model = drawing.modelspace()
     transfer = ['CDR_CONTOURS_1']
+    audit_contours = []
     contour_count = 0
     segment_count = 0
     document = None
@@ -170,15 +171,15 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
                 document = app.OpenDocument(str(working))
                 timings['open_document'] += time.monotonic() - phase_started
                 if page_index is None and document.Pages.Count != 1:
-                    raise ValueError('Prototype supports one-page CDR only; nothing exported.')
+                    raise ValueError('Для многостраничного CDR необходимо выбрать страницу. Экспорт не выполнен.')
                 chosen_page = page_index if page_index is not None else 1
                 if isinstance(chosen_page, bool) or not isinstance(chosen_page, int) or not 1 <= chosen_page <= document.Pages.Count:
-                    raise ValueError('Invalid source page index')
+                    raise ValueError('Некорректный номер исходной страницы.')
                 scale = app.ConvertUnits(1, document.Unit, 3)
                 # Master-page objects require a separate page-placement implementation.
                 for master in document.MasterPage.Layers:
                     if master.Shapes.Count:
-                        raise ValueError('Master-page objects are not supported yet: '+master.Name)
+                        raise ValueError('Объекты мастер-страницы пока не поддерживаются: '+master.Name)
 
                 for layer in document.Pages.Item(chosen_page).Layers:
                     if layer.Name.startswith('_DXF_CHECK_'):
@@ -188,7 +189,7 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
                     name = layer.Name
                     progress('Обработка слоя', layer=name, segments=segment_count, contours=contour_count)
                     if any(c in name for c in '<>/\\":;?*|=\t\r\n'):
-                        raise ValueError('Layer name cannot be preserved in DXF: '+name)
+                        raise ValueError('Название слоя нельзя сохранить в DXF: '+name)
                     base_color = rgb(layer.Color)
                     layer_info = {'name': name, 'rgb': base_color, 'visible': bool(layer.Visible),
                                   'entities': 0, 'source_shapes': layer.Shapes.Count}
@@ -205,10 +206,10 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
                                 emit_shapes(shape.Shapes,write_dxf)
                                 continue
                             if shape.Type not in (1,2,3,6):
-                                raise ValueError(f'Unsupported object type {shape.Type} in layer {name}')
+                                raise ValueError(f'Неподдерживаемый тип объекта {shape.Type} на слое {name}')
                             try:
                                 if shape.PowerClip is not None:
-                                    raise ValueError('PowerClip is not supported: '+name)
+                                    raise ValueError('Объекты PowerClip пока не поддерживаются. Слой: '+name)
                             except AttributeError:
                                 pass
                             shape_dxf = write_dxf
@@ -235,7 +236,7 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
                             for subpath in curve.SubPaths:
                                 expected_count = subpath.Segments.Count
                                 if not expected_count:
-                                    raise ValueError('Empty subpath in layer '+name)
+                                    raise ValueError('Пустой контур на слое '+name)
                                 contour_count += 1
                                 closed = bool(subpath.Closed)
                                 progress('Пакетное чтение контура', layer=name,
@@ -243,6 +244,9 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
                                 phase_started = time.monotonic()
                                 original_segments = decode_subpath(
                                     subpath.GetCurveInfo(), scale, expected_count, closed)
+                                if check_vectors and shape_dxf and name.strip().upper() != 'INFO':
+                                    audit_contours.append(dict(id=contour_count, layer=name,
+                                        closed=closed, segments=original_segments))
                                 if closed:
                                     report['validation']['closed'] += 1
                                 elif shape_dxf and requires_closed(name):
@@ -299,9 +303,9 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
                         layer_info['rgb'] = next(iter(colors))
                         dxf_layer.rgb = layer_info['rgb']
                     elif len(colors) > 1:
-                        report['warnings'].append('Mixed object colours on layer '+name+'; DXF retains object colours, Aspire may display one layer colour.')
+                        report['warnings'].append('На слое '+name+' объекты разных цветов. В DXF цвета объектов сохранены; Aspire может отображать весь слой одним цветом.')
                     if not layer.Visible:
-                        report['warnings'].append('Hidden source layer imported visibly: '+name)
+                        report['warnings'].append('Скрытый исходный слой экспортирован как видимый: '+name)
                     report['layers'].append(layer_info)
             finally:
                 if document is not None:
@@ -312,9 +316,15 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
         if previous is not None:
             previous.Activate()
     if hashlib.sha256(source.read_bytes()).hexdigest() != original_hash:
-        raise RuntimeError('Source file changed during conversion; output withheld.')
+        raise RuntimeError('Исходный файл изменился во время преобразования. Итоговый DXF не сохранён.')
     if not len(model):
-        raise ValueError('No supported vectors found.')
+        raise ValueError('Не найдены векторы, пригодные для экспорта.')
+    if check_vectors:
+        from vector_audit import audit as audit_vectors
+        def audit_progress(layer, index, total, stage, done, count):
+            progress('Проверка векторов: ' + stage, layer=layer, optimized=done, total=count)
+        report['vector_check'] = audit_vectors(audit_contours, tolerance=.1, progress=audit_progress)
+        report['vector_check']['tolerance_mm'] = .1
     target = output_dir/'drawing.dxf'
     progress('Запись DXF', segments=segment_count, contours=contour_count)
     drawing.saveas(target)
@@ -322,7 +332,7 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
     check = ezdxf.readfile(target)
     audit = check.audit()
     if audit.has_errors:
-        raise RuntimeError('DXF audit failed: '+str(audit.errors))
+        raise RuntimeError('Проверка структуры DXF выявила ошибки: '+str(audit.errors))
     report['entities'] = dict(Counter(e.dxftype() for e in check.modelspace()))
     report['contours'] = contour_count
     report['elapsed_seconds'] = round(time.monotonic() - started, 2)
@@ -331,9 +341,9 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
     report['contour_file'] = str(output_dir/'contours.txt')
     report['dxf'] = str(target)
     if report['text_objects_outlined']:
-        report['warnings'].append('Text outlined on temporary copy. Verify fonts visually against CorelDRAW.')
+        report['warnings'].append('Текст преобразован в кривые во временной копии. Сравните его внешний вид с исходником в CorelDRAW.')
     if report['editable_dxf_text']:
-        report['warnings'].append('INFO text is editable MTEXT in DXF; Aspire contour transfer remains outlined. Text uses nominal font size and approximate top-left placement; mixed formatting, mirroring and text effects are not reproduced. Verify typography in the receiving application.')
+        report['warnings'].append('Текст слоя INFO сохранён в DXF как редактируемый текст (MTEXT). Размер шрифта берётся из исходника, положение приближённое. Смешанное форматирование, зеркальное отражение и текстовые эффекты не переносятся. Проверьте вид и расположение текста после открытия DXF.' + ('' if connected else ' При передаче контуров в Aspire текст остаётся кривыми.'))
     (output_dir/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     return report
 

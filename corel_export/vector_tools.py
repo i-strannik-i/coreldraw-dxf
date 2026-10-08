@@ -17,10 +17,10 @@ from vector_audit import audit, ambiguous_endpoints
 
 MARK_PREFIX = '_DXF_CHECK_'
 ISSUE_STYLES = {
-    'zero': ('Нулевой участок', 'Узел без длины', '#007e99'),
-    'overlap': ('Наложение', 'Совпадающие участки', '#8741af'),
-    'intersection': ('Пересечение / касание', 'Векторы встречаются', '#c5363d'),
-    'open': ('Открытый контур', 'Концы не соединены', '#a85b00'),
+    'zero': ('Нулевой участок', 'Блокирует экспорт', '#c5363d'),
+    'overlap': ('Наложение', 'Предупреждение: проверьте визуально', '#7843a3'),
+    'intersection': ('Пересечение / касание', 'Предупреждение: проверьте визуально', '#a65300'),
+    'open': ('Открытый контур', 'Предупреждение, экспорт разрешён', '#006a9e'),
 }
 
 
@@ -218,6 +218,8 @@ class CorelSession:
 
     def apply_join(self):
         self.unchanged()
+        if {int(s.StaticID) for s in self.app.ActiveSelectionRange} != set(self.refs):
+            raise ValueError('Выделение изменилось. Пересчитайте предпросмотр соединения.')
         # Undo includes both the replacement and removal of the selected originals.
         self.doc.BeginCommandGroup('Соединить контуры DXF')
         changed=False
@@ -229,6 +231,9 @@ class CorelSession:
             for s in self.refs.values():originals.Add(s)
             originals.Delete()
             result.CreateSelection()
+            for layer in self.marker_layers():
+                layer.Editable=True
+                layer.Delete()
         except Exception:
             self.doc.EndCommandGroup()
             if changed:self.doc.Undo()
@@ -241,7 +246,7 @@ class CorelSession:
 def main():
     import tkinter as tk
     from tkinter import ttk,messagebox
-    root=tk.Tk(); root.title('DXF: соединение контуров' if '--join' in sys.argv else 'DXF: проверка векторов')
+    root=tk.Tk(); root.title('DXF: проверка векторов')
     root.geometry('790x780');root.minsize(750,720)
     frame=ttk.Frame(root,padding=16);frame.pack(fill='both',expand=True)
     try:session=CorelSession()
@@ -252,7 +257,7 @@ def main():
     def safe(action):
         try:action()
         except Exception as error:messagebox.showerror('DXF',str(error),parent=root)
-    if '--join' in sys.argv:
+    if '--legacy-join' in sys.argv:
         status.set('Исходные векторы не изменяются при предпросмотре.')
         root.minsize(630,350)
         root.geometry('630x350')
@@ -302,7 +307,7 @@ def main():
         layer_vars={};layer_controls=[]
         for layer in session.page.Layers:
             name=layer.Name
-            if not layer.Visible or excluded_layer(name):continue
+            if not layer.Visible or excluded_layer(name) or layer.Shapes.Count == 0:continue
             if name in layer_vars:continue
             value=tk.BooleanVar(value=True);layer_vars[name]=value
             button=ttk.Checkbutton(layer_list,text=name,variable=value)
@@ -313,6 +318,15 @@ def main():
             button=ttk.Button(layer_row,text=caption,command=lambda value=value:[v.set(value) for v in layer_vars.values()])
             button.pack(side='left',padx=(0,6));layer_controls.append(button)
         layer_count.set(f'Выбрано: {len(layer_vars)} из {len(layer_vars)}')
+        join_box=ttk.LabelFrame(layer_box,text='Соединение / замыкание',padding=8)
+        join_box.pack(side='bottom',fill='x',pady=8,before=layer_area)
+        ttk.Label(join_box,text='Только выделенные кривые\nодного слоя, без заливки.',wraplength=200).pack(anchor='w')
+        ttk.Label(join_box,text='Допуск соединения, мм:').pack(anchor='w',pady=(8,0))
+        join_tolerance=tk.StringVar(value='0,1')
+        join_entry=ttk.Entry(join_box,textvariable=join_tolerance,width=12)
+        join_entry.pack(anchor='w',pady=4)
+        join_text=tk.StringVar(value='Выделите кривые и нажмите\n«Пересчитать выделение».')
+        ttk.Label(join_box,textvariable=join_text,wraplength=200).pack(anchor='w',pady=6)
         settings=ttk.Frame(frame);settings.pack(fill='x',pady=8)
         ttk.Label(settings,text='Допуск проверки кривых, мм:').pack(side='left')
         tolerance=tk.StringVar(value='0,1')
@@ -345,12 +359,23 @@ def main():
             try:
                 # COM references stay in their owning apartment for all operations.
                 worker_session=CorelSession()
+                join_session=CorelSession()
                 while True:
                     command,data=commands.get()
                     if command=='stop':return
                     try:
-                        if command=='scan':
-                            value,only_selected,checked_layers=data
+                        if command=='join_preview':
+                            revision,value=data
+                            try:
+                                before,after=join_session.prepare_join(value)
+                                messages.put(('join_preview',(revision,before,after,None)))
+                            except Exception as error:
+                                messages.put(('join_preview',(revision,None,None,str(error))))
+                        elif command=='join_apply':
+                            join_session.apply_join()
+                            messages.put(('join_applied',None))
+                        elif command=='scan':
+                            value,only_selected,checked_layers,update_marks=data
                             def reading(layer,count):
                                 if cancel_event.is_set():raise InterruptedError('Проверка отменена.')
                                 if count%20==0:messages.put(('reading',(layer,count)))
@@ -358,7 +383,8 @@ def main():
                             def report(*args):messages.put(('progress',args))
                             result=audit(contours,tolerance=value,progress=report,cancelled=cancel_event.is_set)
                             messages.put(('marking',None))
-                            result['marks_updated']=worker_session.refresh_marks(result,cancel_event.is_set)
+                            result['marks_updated']=worker_session.refresh_marks(result,cancel_event.is_set) if update_marks else False
+                            result['after_join']=not update_marks
                             messages.put(('result',(result,skipped,len(contours),value)))
                         else:
                             if command=='focus':worker_session.focus(data)
@@ -370,7 +396,7 @@ def main():
             finally:pythoncom.CoUninitialize()
         threading.Thread(target=background,daemon=True).start()
         names={'intersection':'Пересечение/касание','overlap':'Наложение','open':'Открытый конец','zero':'Нулевой участок'}
-        def scan():
+        def scan(update_marks=True):
             if state['busy']:return
             try:value=float(tolerance.get().replace(',','.'))
             except ValueError:raise ValueError('Введите допуск числом, например 0,1 мм.')
@@ -380,18 +406,21 @@ def main():
             if not checked_layers:raise ValueError('Отметьте хотя бы один слой для проверки.')
             state['issues']=[]; tree.delete(*tree.get_children())
             state['busy']=True;cancel_event.clear()
+            join_apply.configure(state='disabled');join_refresh.configure(state='disabled');join_entry.configure(state='disabled')
             for control in (check,marks,clear,scope,tolerance_entry,*layer_controls):control.configure(state='disabled')
             status.set('Чтение векторов из CorelDRAW…');progress.configure(mode='indeterminate');progress.start()
             cancel.configure(state='normal')
-            commands.put(('scan',(value,selected.get(),checked_layers)))
+            commands.put(('scan',(value,selected.get(),checked_layers,update_marks)))
         def finish():
             state['busy']=False;progress.stop();progress.configure(mode='determinate')
             for control in (check,clear,scope,tolerance_entry,*layer_controls):control.configure(state='normal')
             marks.configure(state='normal' if state['issues'] else 'disabled')
             cancel.configure(state='disabled')
+            join_refresh.configure(state='normal');join_entry.configure(state='normal')
         def action(command,data=None):
             if state['busy']:return
             state['busy']=True
+            join_apply.configure(state='disabled');join_refresh.configure(state='disabled');join_entry.configure(state='disabled')
             for control in (check,marks,clear,scope,tolerance_entry,*layer_controls):control.configure(state='disabled')
             status.set('Выполняется действие в CorelDRAW…')
             commands.put((command,data))
@@ -418,6 +447,24 @@ def main():
                     finish();status.set({'focus':'Место выделено и приближено в CorelDRAW.','mark':'Метки добавлены на отдельный непечатный слой.','clear':'Служебные метки удалены.'}[data])
                 elif kind=='error':
                     finish();status.set(data);progress['value']=0
+                    join_apply.configure(state='disabled')
+                elif kind=='join_preview':
+                    revision,before,after,error=data
+                    finish()
+                    if revision!=join_state['revision']:
+                        schedule_join()
+                    elif error:
+                        join_text.set(error)
+                    else:
+                        join_text.set(f'До: замкнутых {before[0]},\nоткрытых {before[1]}\nПосле: замкнутых {after[0]},\nоткрытых {after[1]}')
+                        join_state['ready']=revision
+                        join_apply.configure(state='normal' if before!=after else 'disabled')
+                        status.set('Предпросмотр готов. Векторы не изменены. Кнопка применения подтверждает соединение.')
+                elif kind=='join_applied':
+                    finish();join_state['ready']=None
+                    join_text.set('Соединение применено.\nОтмена: Ctrl+Z в CorelDRAW.')
+                    join_apply.configure(state='disabled')
+                    safe(lambda:scan(False))
                 elif kind=='result':
                     result,skipped,count,value=data
                     state['issues']=result['issues']
@@ -425,13 +472,39 @@ def main():
                         x,y=issue['point'];tree.insert('', 'end',iid=str(i),tags=(issue['kind'],),values=(str(i+1)+'. '+names[issue['kind']]+(' *' if issue['approx'] else ''),issue['layer'],f'{x:.3f}',f'{y:.3f}'))
                     finish();progress['value']=100 if result['complete'] else 0
                     status.set(f'Проверено контуров: {count}. Допуск: {value:g} мм. Найдено мест: {len(result["issues"])}. Пропущено объектов: {len(skipped)}. '+(('Выберите строку — Corel выделит и приблизит место.' if result['issues'] else 'По проверенным критериям проблем не найдено.') if result['complete'] else 'Достигнут лимит: результат НЕ полный.'))
-                    status.set(status.get()+(' Метки обновлены.' if result['marks_updated'] else ' Прежние метки сохранены.'))
+                    status.set(status.get()+(' После соединения: «Показать метки» добавит метки. Ctrl+Z отменяет соединение.' if result.get('after_join') else (' Метки обновлены.' if result['marks_updated'] else ' Прежние метки сохранены.')))
             root.after(150,poll)
         row=ttk.Frame(frame);row.pack(fill='x',pady=10)
         check=ttk.Button(row,text='Проверить',command=lambda:safe(scan));check.pack(side='left')
         marks=ttk.Button(row,text='Показать метки',command=lambda:action('mark',state['issues']),state='disabled');marks.pack(side='left',padx=6)
         clear=ttk.Button(row,text='Убрать мои метки',command=lambda:action('clear'));clear.pack(side='left')
         cancel=ttk.Button(row,text='Отменить проверку',command=cancel_event.set,state='disabled');cancel.pack(side='right')
+        join_state={'revision':0,'ready':None,'timer':None}
+        def preview_join():
+            join_state['timer']=None
+            if state['busy']:
+                join_state['timer']=root.after(400,preview_join)
+                return
+            try:
+                value=float(join_tolerance.get().replace(',','.'))
+                if not math.isfinite(value) or not 0<value<=1:raise ValueError()
+            except ValueError:
+                join_text.set('Введите допуск больше 0\nи не больше 1 мм.');return
+            join_text.set('Пересчитываю…')
+            action('join_preview',(join_state['revision'],value))
+        def schedule_join(*args):
+            join_state['revision']+=1;join_state['ready']=None
+            join_apply.configure(state='disabled')
+            if join_state['timer'] is not None:root.after_cancel(join_state['timer'])
+            join_state['timer']=root.after(400,preview_join)
+        def apply_join_preview():
+            if state['busy'] or join_state['ready']!=join_state['revision']:return
+            action('join_apply')
+        join_refresh=ttk.Button(join_box,text='Пересчитать выделение',command=schedule_join)
+        join_refresh.pack(fill='x',pady=4)
+        join_apply=ttk.Button(join_box,text='Применить соединение\nи замыкание',command=apply_join_preview,state='disabled')
+        join_apply.pack(fill='x',pady=4)
+        join_tolerance.trace_add('write',schedule_join)
         def invalidate(*args):
             if state['busy']:return
             layer_count.set(f'Выбрано: {sum(v.get() for v in layer_vars.values())} из {len(layer_vars)}')

@@ -12,7 +12,7 @@ def distance_to_chord(point, start, end):
 def polyline_vertices(segments, closed, tolerance):
     from convert_cdr import circle_fit, split
     if tolerance <= 0 or not math.isfinite(tolerance):
-        raise ValueError('Connected DXF requires a positive approximation tolerance')
+        raise ValueError('Для экспорта связанных контуров допуск аппроксимации должен быть больше нуля.')
     vertices = []
 
     def emit(points, depth=0):
@@ -30,7 +30,7 @@ def polyline_vertices(segments, closed, tolerance):
             vertices.append((*start, math.tan(sweep/4) * (1 if cross > 0 else -1)))
             return
         if depth >= 24:
-            raise ValueError('Cannot represent curve within the DXF tolerance')
+            raise ValueError('Не удалось представить кривую с заданным допуском DXF.')
         left, right = split(points)
         emit(left, depth+1)
         emit(right, depth+1)
@@ -38,7 +38,7 @@ def polyline_vertices(segments, closed, tolerance):
     previous = None
     for kind, points in segments:
         if previous is not None and math.dist(previous, points[0]) > 1e-7:
-            raise ValueError('Disconnected source subpath; DXF withheld')
+            raise ValueError('Обнаружен разрыв внутри исходного контура. Итоговый DXF не сохранён.')
         if kind == 'L':
             if math.dist(points[0], points[-1]) > 1e-10:
                 vertices.append((*points[0], 0.))
@@ -46,14 +46,14 @@ def polyline_vertices(segments, closed, tolerance):
             emit(points)
         previous = points[-1]
     if not vertices:
-        raise ValueError('Zero-length source contour')
+        raise ValueError('Исходный контур имеет нулевую длину.')
     if closed:
         if math.dist(segments[0][1][0], previous) > 1e-7:
-            raise ValueError('Closed source has mismatched endpoints; DXF withheld')
+            raise ValueError('У замкнутого исходного контура не совпадают концы. Итоговый DXF не сохранён.')
     else:
         vertices.append((*previous, 0.))
     if len(vertices) < 2:
-        raise ValueError('Degenerate source contour')
+        raise ValueError('Вырожденный исходный контур: недостаточно разных точек.')
     return vertices
 
 

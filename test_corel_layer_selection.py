@@ -4,6 +4,15 @@ from corel_export.vector_tools import CorelSession, excluded_layer, ISSUE_STYLES
 
 
 class LayerSelectionTests(unittest.TestCase):
+    def test_issue_colors_are_distinct_and_readable_on_white(self):
+        colors=[style[2] for style in ISSUE_STYLES.values()]
+        self.assertEqual(len(set(colors)),len(colors))
+        for color in colors:
+            channels=[int(color[i:i+2],16)/255 for i in (1,3,5)]
+            linear=[v/12.92 if v<=.04045 else ((v+.055)/1.055)**2.4 for v in channels]
+            luminance=sum(v*w for v,w in zip(linear,(.2126,.7152,.0722)))
+            self.assertGreaterEqual(1.05/(luminance+.05),4.5,color)
+
     def test_complete_check_replaces_marks_even_if_empty(self):
         from unittest.mock import Mock
         session=CorelSession.__new__(CorelSession);session.mark=Mock()
