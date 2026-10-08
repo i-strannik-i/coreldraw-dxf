@@ -21,7 +21,7 @@ def main():
         session.refresh_marks(result)
         assert len(session.marker_layers())==1
         assert session.marker_layers()[0].Name!=original
-        assert session.marker_layers()[0].Shapes.Count==2
+        assert session.marker_layers()[0].Shapes.Count==3
         doc.Undo()
         assert session.marker_layers()[0].Name==original
         # Cancellation after creation of a replacement must roll it back.
@@ -38,6 +38,16 @@ def main():
         session.refresh_marks(clean)
         assert not session.marker_layers()
         assert layer.Shapes.Count==2
+        # All problem kinds at the same point must have non-overlapping numbers.
+        from marker_layout import overlaps
+        from vector_tools import ISSUE_STYLES
+        issues=[dict(kind=kind,point=(5,5),ids=[int(second.StaticID)],layer='CUT_ON',approx=False)
+                for kind in list(ISSUE_STYLES)*2]
+        session.mark(issues)
+        labels=[s for s in session.marker_layers()[0].Shapes if s.Type==6]
+        assert len(labels)==10
+        boxes=[(s.LeftX,s.BottomY,s.RightX,s.TopY) for s in labels]
+        assert all(not overlaps(a,b,0) for i,a in enumerate(boxes) for b in boxes[i+1:])
         print('PASS: replacement, no accumulation, Undo, cancellation rollback, zero-issue cleanup; original vectors retained')
     finally:
         doc.Dirty=False;doc.Close()

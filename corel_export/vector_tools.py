@@ -15,6 +15,8 @@ if not getattr(sys, 'frozen', False):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'engine'))
 from corel_geometry import decode_subpath
 from vector_audit import audit, ambiguous_endpoints
+from duplicate_geometry import duplicate_groups, DUPLICATE_PREFIX
+from marker_layout import place_label
 
 MARK_PREFIX = '_DXF_CHECK_'
 ISSUE_STYLES = {
@@ -22,6 +24,7 @@ ISSUE_STYLES = {
     'overlap': ('Наложение', 'Предупреждение: проверьте визуально', '#7843a3'),
     'intersection': ('Пересечение / касание', 'Предупреждение: проверьте визуально', '#a65300'),
     'open': ('Открытый контур', 'Предупреждение, экспорт разрешён', '#006a9e'),
+    'duplicate': ('Дубли', 'Полностью совпадающие объекты одного слоя', '#27733a'),
 }
 
 
@@ -43,7 +46,7 @@ def check_summary(result, count, skipped, tolerance, selected, layers):
 
 def excluded_layer(name):
     name=name.strip().upper()
-    return name.startswith(MARK_PREFIX) or name in {
+    return name.startswith((MARK_PREFIX,DUPLICATE_PREFIX)) or name in {
         'INFO','GUIDES','GUIDELINES','DESKTOP','DOCUMENT GRID','GRID',
         'НАПРАВЛЯЮЩИЕ','РАБОЧИЙ СТОЛ','СЕТКА ДОКУМЕНТА','СЕТКА',
     }
@@ -69,6 +72,10 @@ def draw_issue_symbol(canvas, kind, color):
         canvas.create_line(18,9,8,9,8,39,40,39,40,9,30,9,fill=line,width=2)
         for x in (18,30):canvas.create_oval(x-3,6,x+3,12,fill=color,outline=color)
         canvas.create_line(21,9,27,9,fill=color,width=2,dash=(2,2))
+    elif kind=='duplicate':
+        canvas.create_rectangle(10,8,31,29,outline=color,width=2)
+        canvas.create_rectangle(17,15,38,36,outline=color,width=2)
+        canvas.create_text(24,23,text='=',fill=color)
 
 
 class CorelSession:
@@ -185,6 +192,8 @@ class CorelSession:
                 changed=True
                 layer.Printable=False
             colors={kind:tuple(int(style[2][i:i+2],16) for i in (1,3,5)) for kind,style in ISSUE_STYLES.items()}
+            occupied=[]
+            marker_boxes=[(i['point'][0]-1,i['point'][1]-1,i['point'][0]+1,i['point'][1]+1) for i in issues]
             for number,issue in enumerate(issues,1):
                 check_cancel()
                 x,y=(v/self.scale for v in issue['point']); radius=1/self.scale
@@ -195,7 +204,18 @@ class CorelSession:
                 circle.Outline.Color.RGBAssign(*colors[issue['kind']])
                 text=layer.CreateArtisticText(x+radius,y+radius,str(number))
                 text.Name='DXF_CHECK_MARKER_V1'
+                text.Text.Story.Size=8
                 text.Fill.UniformColor.RGBAssign(*colors[issue['kind']])
+                width,height=text.SizeWidth*self.scale,text.SizeHeight*self.scale
+                box=place_label(issue['point'],issue['kind'],width,height,occupied,marker_boxes)
+                occupied.append(box)
+                text.Move(box[0]/self.scale-text.LeftX,box[1]/self.scale-text.BottomY)
+                px,py=issue['point']
+                end_x=min(max(px,box[0]),box[2]);end_y=min(max(py,box[1]),box[3])
+                leader=layer.CreateLineSegment(x,y,end_x/self.scale,end_y/self.scale)
+                leader.Name='DXF_CHECK_MARKER_V1'
+                leader.Outline.Width=.1/self.scale
+                leader.Outline.Color.RGBAssign(*colors[issue['kind']])
             if layer is not None:layer.Editable=False
             check_cancel()
             # Replace only after the new set is ready; one Undo restores the old set.
@@ -209,6 +229,39 @@ class CorelSession:
         else:
             self.doc.EndCommandGroup()
             self.mark_layer=layer
+
+    def move_duplicates(self, groups):
+        self.unchanged()
+        expected=duplicate_groups(self.contours)
+        order=lambda group:(group['layer'],group['keep'])
+        if not groups or sorted(groups,key=order)!=sorted(expected,key=order):
+            raise ValueError('Список дублей устарел. Повторите полную проверку.')
+        copies=[self.refs[sid] for group in groups for sid in group['copies']]
+        for shape in copies:
+            if shape.ParentGroup is not None or shape.Locked or not shape.Layer.Editable:
+                raise ValueError('Есть дубли в группе или заблокированные объекты. Проверьте их вручную; ничего не перенесено.')
+        self.doc.BeginCommandGroup('Перенести дубли DXF на проверку')
+        changed=False
+        try:
+            layers={}
+            for shape in copies:
+                original=shape.Layer.Name
+                if original not in layers:
+                    target=self.page.CreateLayer(DUPLICATE_PREFIX+'__'+original+'__'+uuid.uuid4().hex[:8])
+                    changed=True;target.Printable=False;layers[original]=target
+                shape.MoveToLayer(layers[original])
+            for layer in self.marker_layers():
+                layer.Editable=True;layer.Delete()
+            originals=self.app.CreateShapeRange()
+            for group in groups:originals.Add(self.refs[group['keep']])
+            originals.CreateSelection()
+        except Exception:
+            self.doc.EndCommandGroup()
+            if changed:self.doc.Undo()
+            raise
+        else:self.doc.EndCommandGroup()
+        self.refs={};self.contours=[]
+        return len(copies)
 
     def prepare_join(self,tolerance):
         if not math.isfinite(tolerance) or not 0<tolerance<=1:
@@ -416,7 +469,7 @@ def main():
         legend=ttk.Frame(frame)
         legend.pack(fill='x',pady=(2,10))
         filter_buttons={}
-        filter_names={'zero':'Нулевые','overlap':'Наложения','intersection':'Пересечения','open':'Открытые'}
+        filter_names={'zero':'Нулевые','overlap':'Наложения','intersection':'Пересечения','open':'Открытые','duplicate':'Дубли'}
         for index,kind in enumerate(filter_names):
             control=ttk.Button(legend,text=filter_names[kind]+' · 0',style=kind+'.TButton',command=lambda kind=kind:filter_issues(kind))
             control.grid(row=0,column=index,sticky='ew',padx=(0,6));legend.columnconfigure(index,weight=1)
@@ -452,12 +505,13 @@ def main():
         def render_issues():
             tree.delete(*tree.get_children())
             for kind,control in filter_buttons.items():
-                count=sum(issue['kind']==kind for issue in state['issues'])
+                count=sum(len(issue['copies']) if kind=='duplicate' else 1 for issue in state['issues'] if issue['kind']==kind)
                 control.configure(text=filter_names[kind]+f' · {count}'+(' ✓' if state['filter']==kind else ''))
             for i,issue in enumerate(state['issues']):
                 if state['filter'] and issue['kind']!=state['filter']:continue
                 x,y=issue['point']
-                tree.insert('','end',iid=str(i),tags=(issue['kind'],),values=(str(i+1)+'. '+names[issue['kind']]+(' *' if issue['approx'] else ''),issue['layer'],f'{x:.3f}',f'{y:.3f}'))
+                title=names[issue['kind']]+(f': копий {len(issue["copies"])}' if issue['kind']=='duplicate' else '')
+                tree.insert('','end',iid=str(i),tags=(issue['kind'],),values=(str(i+1)+'. '+title+(' *' if issue['approx'] else ''),issue['layer'],f'{x:.3f}',f'{y:.3f}'))
         def filter_issues(kind):
             if state['busy']:return
             state['filter']=None if state['filter']==kind else kind
@@ -484,6 +538,9 @@ def main():
                         elif command=='join_apply':
                             join_session.apply_join()
                             messages.put(('join_applied',None))
+                        elif command=='move_duplicates':
+                            count=worker_session.move_duplicates(data)
+                            messages.put(('duplicates_moved',count))
                         elif command=='scan':
                             value,only_selected,checked_layers,update_marks=data
                             def reading(layer,count):
@@ -505,7 +562,7 @@ def main():
             except Exception as error:messages.put(('error',str(error)))
             finally:pythoncom.CoUninitialize()
         threading.Thread(target=background,daemon=True).start()
-        names={'intersection':'Пересечение/касание','overlap':'Наложение','open':'Открытый конец','zero':'Нулевой участок'}
+        names={'intersection':'Пересечение/касание','overlap':'Наложение','open':'Открытый конец','zero':'Нулевой участок','duplicate':'Дубли'}
         def scan(update_marks=True):
             if state['busy'] or exporter.busy:return
             try:value=float(tolerance.get().replace(',','.'))
@@ -515,6 +572,7 @@ def main():
             checked_layers={name for name,var in layer_vars.items() if var.get()}
             if not checked_layers:raise ValueError('Отметьте хотя бы один слой для проверки.')
             state['issues']=[]; render_issues()
+            state['complete']=False;duplicate_button.configure(state='disabled')
             state['scan_scope']=(selected.get(),set(checked_layers))
             state['scanning']=True
             record_check('Проверка выполняется. Итог ещё не получен.')
@@ -528,11 +586,13 @@ def main():
             state['busy']=False;progress.stop();progress.configure(mode='determinate')
             for control in (check,clear,scope,tolerance_entry,*layer_controls):control.configure(state='normal')
             marks.configure(state='normal' if state['issues'] else 'disabled')
+            duplicate_button.configure(state='normal' if state.get('complete') and any(i['kind']=='duplicate' for i in state['issues']) else 'disabled')
             cancel.configure(state='disabled')
             join_refresh.configure(state='normal');join_entry.configure(state='normal')
         def action(command,data=None):
             if state['busy'] or exporter.busy:return
             state['busy']=True
+            duplicate_button.configure(state='disabled')
             join_apply.configure(state='disabled');join_refresh.configure(state='disabled');join_entry.configure(state='disabled')
             for control in (check,marks,clear,scope,tolerance_entry,*layer_controls):control.configure(state='disabled')
             status.set('Выполняется действие в CorelDRAW…')
@@ -580,9 +640,15 @@ def main():
                     join_text.set('Соединение применено.\nОтмена: Ctrl+Z в CorelDRAW.')
                     join_apply.configure(state='disabled')
                     safe(lambda:scan(False))
+                elif kind=='duplicates_moved':
+                    state['issues']=[];state['complete']=False;render_issues();finish()
+                    progress['value']=0
+                    record_check(f'Перенесено копий: {data}. Оригиналы оставлены на исходных слоях.\nСлои _DXF_DUPLICATES исключены из DXF. Отмена: Ctrl+Z. Повторите проверку.')
+                    status.set('Дубли перенесены, ничего не удалено. Ctrl+Z отменяет весь перенос. CDR не сохранён автоматически.')
                 elif kind=='result':
                     result,skipped,count,value=data
                     state['scanning']=False
+                    state['complete']=result['complete']
                     record_check(check_summary(result,count,skipped,value,*state['scan_scope']))
                     state['issues']=result['issues']
                     render_issues()
@@ -595,6 +661,18 @@ def main():
         marks=ttk.Button(row,text='Показать метки',command=lambda:action('mark',state['issues']),state='disabled');marks.pack(side='left',padx=6)
         clear=ttk.Button(row,text='Убрать мои метки',command=lambda:action('clear'));clear.pack(side='left')
         cancel=ttk.Button(row,text='Отменить проверку',command=cancel_event.set,state='disabled');cancel.pack(side='right')
+        def transfer_duplicates():
+            if state['busy'] or exporter.busy or not state.get('complete'):return
+            groups=[i for i in state['issues'] if i['kind']=='duplicate']
+            count=sum(len(i['copies']) for i in groups)
+            if count and messagebox.askyesno('Перенос дублей',
+                f'Перенести лишних копий: {count}, групп: {len(groups)}?\n'
+                'По одному оригиналу останется на исходном слое. Проверяется геометрия, не цвет или заливка.\n'
+                'Копии попадут в отдельные непечатные слои _DXF_DUPLICATES с именем исходного слоя. '
+                'Эти слои не экспортируются. Ничего не удаляется. Отмена всего переноса: Ctrl+Z.',parent=root):
+                action('move_duplicates',groups)
+        duplicate_button=ttk.Button(layer_box,text='Перенести дубли',command=transfer_duplicates,state='disabled')
+        duplicate_button.pack(side='bottom',fill='x',pady=6,before=layer_area)
         join_state={'revision':0,'ready':None,'timer':None}
         def preview_join():
             join_state['timer']=None
@@ -625,6 +703,7 @@ def main():
             if state['busy']:return
             layer_count.set(f'Выбрано: {sum(v.get() for v in layer_vars.values())} из {len(layer_vars)}')
             state['issues']=[];render_issues();marks.configure(state='disabled')
+            state['complete']=False;duplicate_button.configure(state='disabled')
             progress['value']=0;status.set('Параметры изменены. Нажмите «Проверить».')
             check_result.set('Параметры изменены. Нужна новая проверка. Предыдущие итоги доступны в истории.')
         for variable in (*layer_vars.values(),tolerance,selected):variable.trace_add('write',invalidate)

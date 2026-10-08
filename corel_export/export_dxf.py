@@ -74,10 +74,10 @@ def export_request(request, target, progress, confirm_warnings=None):
         raise GeometryBlocked('Проверка векторов не завершена. DXF не сохранён. Используйте «Проверить» на панели плагина.')
     if any(issue['kind'] == 'zero' for issue in check['issues']):
         raise GeometryBlocked('Обнаружены нулевые участки. DXF не сохранён. Используйте «Проверить» на панели плагина.')
-    warnings = [issue for issue in check['issues'] if issue['kind'] in ('intersection', 'overlap')]
+    warnings = [issue for issue in check['issues'] if issue['kind'] in ('intersection', 'overlap', 'duplicate')]
     if warnings:
         counts = Counter((issue['layer'], issue['kind']) for issue in warnings)
-        names = {'intersection': 'пересечения/касания', 'overlap': 'наложения'}
+        names = {'intersection': 'пересечения/касания', 'overlap': 'наложения', 'duplicate': 'группы дублей'}
         summary = '\n'.join(f'{layer}: {names[kind]} — {count}' for (layer, kind), count in sorted(counts.items()))
         summary += '\nЭто места для визуальной проверки, а не подтверждённые дефекты. Допуск проверки: 0,1 мм.'
         if confirm_warnings is None or not confirm_warnings(summary):

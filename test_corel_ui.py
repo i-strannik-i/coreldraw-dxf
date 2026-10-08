@@ -15,9 +15,8 @@ class BetaUiTests(unittest.TestCase):
             rgb=[int(color[i:i+2],16)/255 for i in (1,3,5)]
             return sum((v/12.92 if v<=.04045 else ((v+.055)/1.055)**2.4)*w for v,w in zip(rgb,(.2126,.7152,.0722)))
         for p in THEMES.values():
-            colors=[p[k] for k in ('zero','overlap','intersection','open')]
-            self.assertEqual(len(set(colors)),4)
+            colors=[p[k] for k in ('zero','overlap','intersection','open','duplicate')]
+            self.assertEqual(len(set(colors)),5)
             for color in colors:
                 a,b=sorted((luminance(p['panel']),luminance(color)))
                 self.assertGreaterEqual((b+.05)/(a+.05),4.5)
-

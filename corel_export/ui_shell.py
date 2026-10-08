@@ -16,9 +16,9 @@ except ImportError:
 
 THEMES = {
     'light': dict(bg='#f3f6f7', panel='#ffffff', text='#233342', muted='#586977', line='#d6e0e5', accent='#087f8c', selected='#dceff2',
-                  zero='#c5363d', overlap='#7843a3', intersection='#a65300', open='#006a9e'),
+                  zero='#c5363d', overlap='#7843a3', intersection='#a65300', open='#006a9e', duplicate='#27733a'),
     'dark': dict(bg='#20272e', panel='#29333d', text='#edf3f7', muted='#b5c1cb', line='#455461', accent='#54c5ce', selected='#34515e',
-                 zero='#ff858b', overlap='#cda0ff', intersection='#ffbd70', open='#78c8ff'),
+                 zero='#ff858b', overlap='#cda0ff', intersection='#ffbd70', open='#78c8ff', duplicate='#80d596'),
 }
 
 
@@ -60,7 +60,7 @@ def apply_theme(root, name, tree=None, canvas=None):
     style.configure('Treeview', background=p['panel'], fieldbackground=p['panel'], foreground=p['text'], rowheight=30, borderwidth=1)
     style.configure('Treeview.Heading', background=p['bg'], foreground=p['muted'], padding=8)
     style.map('Treeview', background=[('selected',p['selected'])], foreground=[('selected',p['text'])])
-    for kind in ('zero','overlap','intersection','open'):
+    for kind in ('zero','overlap','intersection','open','duplicate'):
         style.configure(kind+'.TButton', foreground=p[kind])
         if tree is not None:
             tree.tag_configure(kind, foreground=p[kind])

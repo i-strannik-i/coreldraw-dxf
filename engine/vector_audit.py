@@ -2,6 +2,7 @@
 import math
 from collections import defaultdict
 from contour_dxf import distance_to_chord, requires_closed
+from duplicate_geometry import duplicate_groups
 
 
 def flatten(points, error=.005, depth=0):
@@ -66,6 +67,10 @@ def audit(contours, *, tolerance=.1, limit=1000, progress=None, cancelled=None):
 
 def _audit_layer(contours, tolerance, limit, report):
     issues, seen, spans = [],set(),[]
+    report('Поиск дублей',0,len(contours))
+    duplicates=duplicate_groups(contours)
+    duplicate_ids={sid:group['keep'] for group in duplicates for sid in group['ids']}
+    issues.extend(duplicates[:limit])
     def add(kind,point,ids,layer,approx=False):
         key=(kind,tuple(sorted(set(ids))),round(point[0],2),round(point[1],2))
         if key not in seen and len(issues)<limit:
@@ -95,6 +100,7 @@ def _audit_layer(contours, tolerance, limit, report):
             if s[2]>t[3]+1e-8 or t[2]>s[3]+1e-8:continue
             ca,cb=contours[s[6]],contours[t[6]]
             if ca['layer']!=cb['layer']:continue
+            if ca['id']!=cb['id'] and ca['id'] in duplicate_ids and duplicate_ids[ca['id']]==duplicate_ids.get(cb['id']):continue
             comparisons+=1
             if comparisons % 10000 == 0:
                 report('Поиск пересечений', number, len(spans))

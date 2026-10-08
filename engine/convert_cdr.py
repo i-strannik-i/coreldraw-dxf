@@ -182,7 +182,7 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
                         raise ValueError('Объекты мастер-страницы пока не поддерживаются: '+master.Name)
 
                 for layer in document.Pages.Item(chosen_page).Layers:
-                    if layer.Name.startswith('_DXF_CHECK_'):
+                    if layer.Name.strip().upper().startswith(('_DXF_CHECK_', '_DXF_DUPLICATES')):
                         continue
                     if layer.Shapes.Count == 0 and layer.Name == 'Guides':
                         continue
@@ -245,7 +245,7 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
                                 original_segments = decode_subpath(
                                     subpath.GetCurveInfo(), scale, expected_count, closed)
                                 if check_vectors and shape_dxf and name.strip().upper() != 'INFO':
-                                    audit_contours.append(dict(id=contour_count, layer=name,
+                                    audit_contours.append(dict(id=int(shape.StaticID), layer=name,
                                         closed=closed, segments=original_segments))
                                 if closed:
                                     report['validation']['closed'] += 1
@@ -326,6 +326,8 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
         report['vector_check'] = audit_vectors(audit_contours, tolerance=.1, progress=audit_progress)
         report['vector_check']['tolerance_mm'] = .1
     target = output_dir/'drawing.dxf'
+    if not len(model):
+        raise ValueError('В выбранной области нет объектов для DXF. Служебные метки и слои дублей исключены. Существующий DXF не заменён.')
     progress('Запись DXF', segments=segment_count, contours=contour_count)
     drawing.saveas(target)
     progress('Проверка DXF', segments=segment_count, contours=contour_count)
