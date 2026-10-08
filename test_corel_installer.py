@@ -45,15 +45,15 @@ class InstallerTests(unittest.TestCase):
             panel = root.find(f'.//commandBarData[@guid="{BAR}"]/toolbar')
             self.assertIsNotNone(panel)
             self.assertEqual(panel.get('itemFace'), 'textRightOfImage')
-            self.assertEqual([item.get('guidRef') for item in panel], [EXPORT, CHECK, HELP])
+            self.assertEqual([item.get('guidRef') for item in panel], [EXPORT, CHECK])
             self.assertTrue(all(item.get('itemFace') == 'textRightOfImage' for item in panel))
             self.assertEqual(len(root.findall(f'.//toolbar[@guidRef="{BAR}"]')), 1)
             standard = root.find(f'.//commandBarData[@guid="{STANDARD}"]/toolbar')
             self.assertEqual(len(standard.findall('item')), 0)
-            for guid in (EXPORT, HELP):
+            for guid in (EXPORT, CHECK):
                 self.assertEqual(len(root.findall(f'.//item[@guidRef="{guid}"]')), 1)
             self.assertIsNotNone(root.find('.//commandBarData[@guid="unrelated"]'))
-            for guid in (EXPORT, HELP):
+            for guid in (EXPORT, CHECK):
                 self.assertEqual(len(root.findall(f'.//itemData[@guid="{guid}"]')), 1)
                 self.assertEqual(archive.read('content/icons/' + guid + '.ico'), b'icon')
                 self.assertEqual(root.find(f'.//itemData[@guid="{guid}"]').get('icon'), 'guid://' + guid)

@@ -23,6 +23,7 @@ class UpdateTests(unittest.TestCase):
             launch.assert_not_called()
 
     def setUp(self):
+        channel=patch.object(u,'CHANNEL','stable');channel.start();self.addCleanup(channel.stop)
         self.temp=tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.folder=Path(self.temp.name)
@@ -30,6 +31,13 @@ class UpdateTests(unittest.TestCase):
                    'file':'SetupCorelDXF-9.0.0.exe','size':4,'sha256':hashlib.sha256(b'test').hexdigest()}
         (self.folder/self.info['file']).write_bytes(b'test')
         self.write()
+
+    def test_beta_discovers_prereleases(self):
+        listing=[{'tag_name':'v9.0.0','prerelease':True,'draft':False}]
+        with patch.object(u,'CHANNEL','beta'), patch.object(u,'read_url',side_effect=[json.dumps(listing).encode(),json.dumps(self.info).encode()]):
+            info=u.github_release()
+            self.assertTrue(info['available'])
+            self.assertIn('/download/v9.0.0/',info['_url'])
 
     def write(self):
         (self.folder/u.MANIFEST).write_text(json.dumps(self.info),encoding='utf-8')

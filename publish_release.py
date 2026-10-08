@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
-from corel_export.version import VERSION, INSTALLER_NAME
+from corel_export.version import VERSION, INSTALLER_NAME, CHANNEL
 
 
 def main():
@@ -15,7 +15,7 @@ def main():
     root = Path(__file__).parent / 'corel_export'
     installer = root / (INSTALLER_NAME + '.exe')
     data = installer.read_bytes()
-    info = {'product': 'CorelDXF', 'version': VERSION, 'corel_major': 25,
+    info = {'product': 'CorelDXF', 'version': VERSION, 'channel': CHANNEL, 'corel_major': 25,
             'file': installer.name, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
     manifest = root / 'CorelDXF-latest.json'
     manifest.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding='utf-8')

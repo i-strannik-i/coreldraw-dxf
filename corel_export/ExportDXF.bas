@@ -38,15 +38,13 @@ Private Function ExportBusy() As Boolean
 End Function
 
 Public Sub ShowExporter()
-    AutoCheckUpdates
     If Application.Documents.Count = 0 Then Exit Sub
     If ExportBusy() Then Exit Sub
-    DXFOptions.Show
+    LaunchVectorTools "--export"
 End Sub
 
 Public Sub ShowLayerHelp()
-    AutoCheckUpdates
-    LayerHelp.Show
+    LaunchVectorTools "--help"
 End Sub
 
 Public Sub ShowHotkeys()

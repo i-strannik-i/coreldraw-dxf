@@ -13,9 +13,9 @@ import threading
 import urllib.request
 
 try:
-    from .version import VERSION
+    from .version import VERSION, CHANNEL
 except ImportError:
-    from version import VERSION
+    from version import VERSION, CHANNEL
 
 MANIFEST = 'CorelDXF-latest.json'
 GITHUB_REPO = 'i-strannik-i/coreldraw-dxf'
@@ -35,6 +35,20 @@ def read_url(url, limit):
 
 
 def github_release():
+    if CHANNEL == 'beta':
+        try:
+            releases=json.loads(read_url('https://api.github.com/repos/'+GITHUB_REPO+'/releases?per_page=20',262144))
+            tags=[item['tag_name'][1:] for item in releases if not item.get('draft') and re.fullmatch(r'v\d+\.\d+\.\d+',item.get('tag_name',''))]
+            if tags:
+                version=max(tags,key=version_tuple)
+                base='https://github.com/'+GITHUB_REPO+'/releases/download/v'+version+'/'
+                info=json.loads(read_url(base+MANIFEST,16384))
+                if info.get('version')!=version:raise ValueError('Версия бета-выпуска не совпала.')
+                validate_info(info,VERSION)
+                info['_url']=base+info['file']
+                return info
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
     # Public latest-release assets avoid shared-IP GitHub API rate limits.
     base = 'https://github.com/' + GITHUB_REPO + '/releases/'
     info = json.loads(read_url(base + 'latest/download/' + MANIFEST, 16384))
@@ -104,7 +118,8 @@ def update_folder():
     try:
         return Path(json.loads(settings_file().read_text(encoding='utf-8'))['folder'])
     except (OSError, ValueError, KeyError):
-        return Path.home() / 'Yandex.Disk/Производство/чертежи фрезер/_плагины'
+        folder=Path.home() / 'Yandex.Disk/Производство/чертежи фрезер/_плагины'
+        return folder/'beta' if CHANNEL=='beta' else folder
 
 
 def check_release(folder, current=VERSION):

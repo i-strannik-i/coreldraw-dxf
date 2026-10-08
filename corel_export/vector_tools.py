@@ -8,6 +8,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import uuid
 
 if not getattr(sys, 'frozen', False):
@@ -246,17 +247,74 @@ class CorelSession:
 def main():
     import tkinter as tk
     from tkinter import ttk,messagebox
-    root=tk.Tk(); root.title('DXF: проверка векторов')
+    try:
+        from .ui_shell import apply_theme, load_theme, save_theme, feedback, THEMES
+        from .version import VERSION
+    except ImportError:
+        from ui_shell import apply_theme, load_theme, save_theme, feedback, THEMES
+        from version import VERSION
+    root=tk.Tk(); root.title('CorelDRAW → DXF · '+VERSION+' beta')
     root.geometry('790x780');root.minsize(750,720)
     frame=ttk.Frame(root,padding=16);frame.pack(fill='both',expand=True)
     try:session=CorelSession()
     except Exception as error:
         messagebox.showerror('DXF',str(error),parent=root);root.destroy();return
-    status=tk.StringVar(value='Выберите допуск и нажмите «Проверить». Исходные векторы не изменяются.')
-    ttk.Label(frame,textvariable=status,wraplength=710).pack(anchor='w',pady=8)
+    header=ttk.Frame(frame);header.pack(fill='x',pady=(0,12))
+    ttk.Label(header,text='CorelDRAW → DXF',style='Title.TLabel').pack(side='left')
+    ttk.Label(header,text=VERSION+' beta · Strannik',style='Muted.TLabel').pack(side='left',padx=14)
+    theme_value=tk.StringVar(value='Тёмная' if load_theme()=='dark' else 'Светлая')
+    theme_picker=ttk.Combobox(header,textvariable=theme_value,values=('Светлая','Тёмная'),state='readonly',width=9)
+    theme_picker.pack(side='right')
+    ttk.Label(header,text='Тема').pack(side='right',padx=6)
+    notebook=ttk.Notebook(frame);notebook.pack(fill='both',expand=True)
+    export_tab=ttk.Frame(notebook,padding=20)
+    check_tab=ttk.Frame(notebook,padding=12)
+    help_tab=ttk.Frame(notebook,padding=20)
+    notebook.add(export_tab,text='Экспорт');notebook.add(check_tab,text='Проверка');notebook.add(help_tab,text='Слои и помощь')
+    notebook.select(check_tab if '--check' in sys.argv or '--join' in sys.argv else export_tab)
+    if '--help' in sys.argv:notebook.select(help_tab)
+    status=tk.StringVar(value='Готово. Проверка не изменяет исходные векторы.')
+    ttk.Label(frame,textvariable=status,wraplength=1000,style='Muted.TLabel').pack(side='bottom',anchor='w',pady=(10,0),before=notebook)
+    frame=check_tab
     def safe(action):
         try:action()
         except Exception as error:messagebox.showerror('DXF',str(error),parent=root)
+    def macro(name):
+        session.app.GMSManager.RunMacro('SkladCorelDXF','ExportDXF.'+name)
+    ttk.Label(export_tab,text='Сохранить чертёж в DXF',style='Title.TLabel').pack(anchor='w',pady=(4,16))
+    export_scope=tk.StringVar(value='selection' if session.app.ActiveSelectionRange.Count else 'page')
+    ttk.Radiobutton(export_tab,text='Выделенные объекты',variable=export_scope,value='selection').pack(anchor='w',pady=6)
+    ttk.Radiobutton(export_tab,text='Весь текущий лист',variable=export_scope,value='page').pack(anchor='w',pady=6)
+    ttk.Separator(export_tab).pack(fill='x',pady=20)
+    ttk.Label(export_tab,text='Масштаб 1:1   ·   Миллиметры   ·   Допуск оптимизации 0,1 мм').pack(anchor='w')
+    ttk.Label(export_tab,text='DXF сохраняется рядом с CDR под тем же именем.\nСуществующий DXF получит резервную копию.\nПересечения и наложения требуют подтверждения.\nОткрытые контуры не замыкаются автоматически.',style='Muted.TLabel').pack(anchor='w',pady=16)
+    export_path=tk.StringVar(value=str(session.doc.FullFileName or 'Несохранённый документ: папку предложим выбрать при экспорте.'))
+    ttk.Label(export_tab,textvariable=export_path,wraplength=820).pack(anchor='w',pady=(0,20))
+    def begin_export():
+        if state['busy']:return
+        session.current()
+        if export_scope.get()=='selection' and not session.app.ActiveSelectionRange.Count:
+            raise ValueError('Сначала выделите объекты в CorelDRAW.')
+        status.set('Подготовка экспорта. Ход операции появится в окне журнала.')
+        session.app.GMSManager.RunMacro('SkladCorelDXF','ExportDXF.RunExport',export_scope.get()=='selection')
+    ttk.Button(export_tab,text='Экспортировать DXF',style='Accent.TButton',command=lambda:safe(begin_export)).pack(anchor='w')
+    ttk.Button(export_tab,text='Проверить векторы перед экспортом',command=lambda:notebook.select(check_tab)).pack(anchor='w',pady=12)
+    ttk.Label(help_tab,text='Памятка по слоям',style='Title.TLabel').pack(anchor='w',pady=(0,12))
+    rows=[('INFO','Информационный текст. Без резки и гравировки.'),('#','Артикулы: гравировка на глубину 0,1 мм.'),
+          ('CUT_OUT','Сквозной рез снаружи контура.'),('CUT_IN','Сквозной рез внутри контура.'),('CUT_ON','Рез по линии контура.'),
+          ('D / D4','Отверстия. D4: диаметр 4 мм.'),('B','Круглая фреза: паз под сгиб материала.'),
+          ('P / P_2.5','Выборка. P_2.5: глубина 2,5 мм.'),('V / V_3','Гравировка. V_3: ширина 3 мм, не глубина.'),
+          ('BACK_…','Обратная сторона. Например, BACK_CUT_OUT.')]
+    help_table=ttk.Treeview(help_tab,columns=('layer','meaning'),show='headings',height=10)
+    help_table.heading('layer',text='Слой');help_table.heading('meaning',text='Назначение')
+    help_table.column('layer',width=130,stretch=False);help_table.column('meaning',width=650)
+    for row_values in rows:help_table.insert('','end',values=row_values)
+    help_table.pack(fill='x')
+    ttk.Label(help_tab,text='Названия слоёв — латиницей. Размеры — в мм.\nСоединение: выберите кривые одного слоя → задайте допуск → проверьте «До / После» → примените.\nТема Corel автоматически не считывается: выберите светлую или тёмную тему вверху.',style='Muted.TLabel',wraplength=850).pack(anchor='w',pady=15)
+    help_buttons=ttk.Frame(help_tab);help_buttons.pack(fill='x')
+    ttk.Button(help_buttons,text='Обратная связь',style='Accent.TButton',command=lambda:feedback(root)).pack(side='left')
+    ttk.Button(help_buttons,text='Обновления',command=lambda:safe(lambda:macro('ShowUpdates'))).pack(side='left',padx=8)
+    ttk.Button(help_buttons,text='Горячая клавиша',command=lambda:safe(lambda:macro('ShowHotkeys'))).pack(side='left')
     if '--legacy-join' in sys.argv:
         status.set('Исходные векторы не изменяются при предпросмотре.')
         root.minsize(630,350)
@@ -282,7 +340,7 @@ def main():
         ttk.Button(frame,text='Предпросмотр',command=lambda:safe(preview)).pack(side='left',pady=14)
         apply=ttk.Button(frame,text='Соединить',command=lambda:safe(join),state='disabled');apply.pack(side='left',padx=8)
     else:
-        root.geometry('1080x780');root.minsize(1000,720)
+        root.geometry('1080x800');root.minsize(1000,760)
         body=ttk.Frame(frame);body.pack(fill='both',expand=True,pady=(8,0))
         layer_box=ttk.LabelFrame(body,text='Слои для проверки',padding=10)
         layer_box.pack(side='left',fill='y',padx=(0,16))
@@ -295,7 +353,7 @@ def main():
         ttk.Label(layer_box,textvariable=layer_count).pack(anchor='w',pady=(10,8))
         ttk.Label(layer_box,text='Технические и скрытые слои,\nINFO и метки исключены.\nВ CDR ничего не удаляется.',wraplength=210).pack(side='bottom',anchor='w',pady=(10,0))
         layer_area=ttk.Frame(layer_box);layer_area.pack(fill='both',expand=True)
-        layer_canvas=tk.Canvas(layer_area,width=210,highlightthickness=0)
+        layer_canvas=tk.Canvas(layer_area,width=190,highlightthickness=0)
         layer_scroll=ttk.Scrollbar(layer_area,orient='vertical',command=layer_canvas.yview)
         layer_scroll.pack(side='right',fill='y');layer_canvas.pack(side='left',fill='both',expand=True)
         layer_canvas.configure(yscrollcommand=layer_scroll.set)
@@ -318,40 +376,51 @@ def main():
             button=ttk.Button(layer_row,text=caption,command=lambda value=value:[v.set(value) for v in layer_vars.values()])
             button.pack(side='left',padx=(0,6));layer_controls.append(button)
         layer_count.set(f'Выбрано: {len(layer_vars)} из {len(layer_vars)}')
-        join_box=ttk.LabelFrame(layer_box,text='Соединение / замыкание',padding=8)
-        join_box.pack(side='bottom',fill='x',pady=8,before=layer_area)
-        ttk.Label(join_box,text='Только выделенные кривые\nодного слоя, без заливки.',wraplength=200).pack(anchor='w')
-        ttk.Label(join_box,text='Допуск соединения, мм:').pack(anchor='w',pady=(8,0))
+        join_box=ttk.LabelFrame(frame,text='Соединение и замыкание · только выделенные кривые одного слоя',padding=10)
+        join_box.pack(side='bottom',fill='x',pady=(12,0))
+        join_fields=ttk.Frame(join_box);join_fields.pack(fill='x')
+        ttk.Label(join_fields,text='Допуск, мм:').pack(side='left')
         join_tolerance=tk.StringVar(value='0,1')
-        join_entry=ttk.Entry(join_box,textvariable=join_tolerance,width=12)
-        join_entry.pack(anchor='w',pady=4)
+        join_entry=ttk.Entry(join_fields,textvariable=join_tolerance,width=8)
+        join_entry.pack(side='left',padx=8)
         join_text=tk.StringVar(value='Выделите кривые и нажмите\n«Пересчитать выделение».')
-        ttk.Label(join_box,textvariable=join_text,wraplength=200).pack(anchor='w',pady=6)
+        ttk.Label(join_fields,textvariable=join_text,wraplength=390).pack(side='left',padx=10)
         settings=ttk.Frame(frame);settings.pack(fill='x',pady=8)
         ttk.Label(settings,text='Допуск проверки кривых, мм:').pack(side='left')
         tolerance=tk.StringVar(value='0,1')
         tolerance_entry=ttk.Entry(settings,textvariable=tolerance,width=10)
         tolerance_entry.pack(side='left',padx=8)
-        ttk.Label(frame,text='Каждый слой проверяется отдельно. Между слоями пересечения не ищем.\nДопуск задаёт точность кривых: меньше — точнее, но дольше.\nОткрытые концы отмечаются независимо от допуска; автоматического замыкания нет.\nINFO и служебные метки пропускаются. Найденные места нужно проверить визуально.',wraplength=710).pack(anchor='w',pady=6)
-        legend=ttk.LabelFrame(frame,text='Обозначения проблем',padding=6)
+        ttk.Label(frame,text='Проверка по слоям. Пересечения и касания требуют визуального подтверждения.',style='Muted.TLabel',wraplength=710).pack(anchor='w',pady=6)
+        legend=ttk.Frame(frame)
         legend.pack(fill='x',pady=(2,10))
-        for index,(kind,(title,description,color)) in enumerate(ISSUE_STYLES.items()):
-            card=tk.Frame(legend,bg='#ffffff',padx=6,pady=3)
-            card.grid(row=index//2,column=index%2,sticky='nsew',padx=3,pady=3)
-            legend.columnconfigure(index%2,weight=1)
-            icon=tk.Canvas(card,width=48,height=48,bg='#ffffff',highlightthickness=0)
-            icon.pack(side='left',padx=(0,8));draw_issue_symbol(icon,kind,color)
-            words=tk.Frame(card,bg='#ffffff');words.pack(side='left',fill='x')
-            tk.Label(words,text=title,bg='#ffffff',fg=color,font=('Segoe UI',10,'bold')).pack(anchor='w')
-            tk.Label(words,text=description,bg='#ffffff',fg='#46515c',font=('Segoe UI',9)).pack(anchor='w')
+        filter_buttons={}
+        filter_names={'zero':'Нулевые','overlap':'Наложения','intersection':'Пересечения','open':'Открытые'}
+        for index,kind in enumerate(filter_names):
+            control=ttk.Button(legend,text=filter_names[kind]+' · 0',style=kind+'.TButton',command=lambda kind=kind:filter_issues(kind))
+            control.grid(row=0,column=index,sticky='ew',padx=(0,6));legend.columnconfigure(index,weight=1)
+            filter_buttons[kind]=control
         progress=ttk.Progressbar(frame,maximum=100)
         progress.pack(fill='x',pady=(0,8))
-        tree=ttk.Treeview(frame,columns=('type','layer','x','y'),show='headings',height=11)
+        tree=ttk.Treeview(frame,columns=('type','layer','x','y'),show='headings',height=6)
         for name,title,width in [('type','Проблема',230),('layer','Слой',170),('x','X, мм',100),('y','Y, мм',100)]:
             tree.heading(name,text=title);tree.column(name,width=width)
         tree.pack(fill='both',expand=True)
         for kind,style in ISSUE_STYLES.items():tree.tag_configure(kind,foreground=style[2])
         messages=queue.Queue();commands=queue.Queue();state={'issues':[],'busy':False}
+        state['filter']=None
+        def render_issues():
+            tree.delete(*tree.get_children())
+            for kind,control in filter_buttons.items():
+                count=sum(issue['kind']==kind for issue in state['issues'])
+                control.configure(text=filter_names[kind]+f' · {count}'+(' ✓' if state['filter']==kind else ''))
+            for i,issue in enumerate(state['issues']):
+                if state['filter'] and issue['kind']!=state['filter']:continue
+                x,y=issue['point']
+                tree.insert('','end',iid=str(i),tags=(issue['kind'],),values=(str(i+1)+'. '+names[issue['kind']]+(' *' if issue['approx'] else ''),issue['layer'],f'{x:.3f}',f'{y:.3f}'))
+        def filter_issues(kind):
+            if state['busy']:return
+            state['filter']=None if state['filter']==kind else kind
+            render_issues()
         cancel_event=threading.Event()
         def background():
             import pythoncom
@@ -404,7 +473,7 @@ def main():
                 raise ValueError('Допуск проверки: от 0,001 до 1 мм.')
             checked_layers={name for name,var in layer_vars.items() if var.get()}
             if not checked_layers:raise ValueError('Отметьте хотя бы один слой для проверки.')
-            state['issues']=[]; tree.delete(*tree.get_children())
+            state['issues']=[]; render_issues()
             state['busy']=True;cancel_event.clear()
             join_apply.configure(state='disabled');join_refresh.configure(state='disabled');join_entry.configure(state='disabled')
             for control in (check,marks,clear,scope,tolerance_entry,*layer_controls):control.configure(state='disabled')
@@ -468,14 +537,13 @@ def main():
                 elif kind=='result':
                     result,skipped,count,value=data
                     state['issues']=result['issues']
-                    for i,issue in enumerate(result['issues']):
-                        x,y=issue['point'];tree.insert('', 'end',iid=str(i),tags=(issue['kind'],),values=(str(i+1)+'. '+names[issue['kind']]+(' *' if issue['approx'] else ''),issue['layer'],f'{x:.3f}',f'{y:.3f}'))
+                    render_issues()
                     finish();progress['value']=100 if result['complete'] else 0
                     status.set(f'Проверено контуров: {count}. Допуск: {value:g} мм. Найдено мест: {len(result["issues"])}. Пропущено объектов: {len(skipped)}. '+(('Выберите строку — Corel выделит и приблизит место.' if result['issues'] else 'По проверенным критериям проблем не найдено.') if result['complete'] else 'Достигнут лимит: результат НЕ полный.'))
                     status.set(status.get()+(' После соединения: «Показать метки» добавит метки. Ctrl+Z отменяет соединение.' if result.get('after_join') else (' Метки обновлены.' if result['marks_updated'] else ' Прежние метки сохранены.')))
             root.after(150,poll)
-        row=ttk.Frame(frame);row.pack(fill='x',pady=10)
-        check=ttk.Button(row,text='Проверить',command=lambda:safe(scan));check.pack(side='left')
+        row=ttk.Frame(frame);row.pack(side='bottom',fill='x',pady=10,before=tree)
+        check=ttk.Button(row,text='Проверить',style='Accent.TButton',command=lambda:safe(scan));check.pack(side='left')
         marks=ttk.Button(row,text='Показать метки',command=lambda:action('mark',state['issues']),state='disabled');marks.pack(side='left',padx=6)
         clear=ttk.Button(row,text='Убрать мои метки',command=lambda:action('clear'));clear.pack(side='left')
         cancel=ttk.Button(row,text='Отменить проверку',command=cancel_event.set,state='disabled');cancel.pack(side='right')
@@ -501,20 +569,57 @@ def main():
             if state['busy'] or join_state['ready']!=join_state['revision']:return
             action('join_apply')
         join_refresh=ttk.Button(join_box,text='Пересчитать выделение',command=schedule_join)
-        join_refresh.pack(fill='x',pady=4)
-        join_apply=ttk.Button(join_box,text='Применить соединение\nи замыкание',command=apply_join_preview,state='disabled')
-        join_apply.pack(fill='x',pady=4)
+        join_refresh.pack(side='left',pady=(8,0))
+        join_apply=ttk.Button(join_box,text='Применить соединение и замыкание',command=apply_join_preview,state='disabled')
+        join_apply.pack(side='right',pady=(8,0))
         join_tolerance.trace_add('write',schedule_join)
         def invalidate(*args):
             if state['busy']:return
             layer_count.set(f'Выбрано: {sum(v.get() for v in layer_vars.values())} из {len(layer_vars)}')
-            state['issues']=[];tree.delete(*tree.get_children());marks.configure(state='disabled')
+            state['issues']=[];render_issues();marks.configure(state='disabled')
             progress['value']=0;status.set('Параметры изменены. Нажмите «Проверить».')
         for variable in (*layer_vars.values(),tolerance,selected):variable.trace_add('write',invalidate)
         root.protocol('WM_DELETE_WINDOW',lambda:(cancel_event.set(),commands.put(('stop',None)),root.destroy()))
-        ttk.Label(frame,text='Метки обновляются после полной проверки. Отмена изменения: Ctrl+Z.\nМетки не печатаются и не входят в DXF. Сохранение CDR — вручную.',wraplength=710).pack(anchor='w')
+        ttk.Label(frame,text='Метки не печатаются и не входят в DXF. Сохранение CDR — вручную.',style='Muted.TLabel',wraplength=710).pack(side='bottom',anchor='w',before=tree)
         poll()
+        def refresh_theme(event=None):
+            name='dark' if theme_value.get()=='Тёмная' else 'light'
+            apply_theme(root,name,tree,layer_canvas)
+            try:save_theme(name)
+            except OSError:status.set('Не удалось сохранить тему. В текущем окне она применена.')
+        theme_picker.bind('<<ComboboxSelected>>',refresh_theme)
+        refresh_theme()
+        last_request=[0]
+        def switch_requested_tab():
+            try:
+                request=Path(os.environ['LOCALAPPDATA'])/'SkladCorelDXF/open-tab.json'
+                stamp=request.stat().st_mtime_ns
+                if stamp!=last_request[0]:
+                    last_request[0]=stamp
+                    data=json.loads(request.read_text(encoding='utf-8'))
+                    tab={'export':export_tab,'check':check_tab,'help':help_tab}.get(data.get('tab'))
+                    if tab is not None and abs(time.time()-data.get('created',0))<10:
+                        notebook.select(tab);root.deiconify();root.lift()
+            except (OSError,ValueError,TypeError):pass
+            root.after(350,switch_requested_tab)
+        switch_requested_tab()
     root.mainloop()
 
 
-if __name__=='__main__':main()
+if __name__=='__main__':
+    import win32api
+    import win32event
+    import winerror
+    mutex=win32event.CreateMutex(None,False,'Local\\SkladCorelDXFMainWindow')
+    try:
+        if win32api.GetLastError()==winerror.ERROR_ALREADY_EXISTS:
+            request=Path(os.environ['LOCALAPPDATA'])/'SkladCorelDXF/open-tab.json'
+            request.parent.mkdir(parents=True,exist_ok=True)
+            mode='check' if '--check' in sys.argv or '--join' in sys.argv else ('help' if '--help' in sys.argv else 'export')
+            temp=request.with_name('open-tab-'+str(os.getpid())+'.tmp')
+            temp.write_text(json.dumps({'tab':mode,'created':time.time()}),encoding='utf-8')
+            os.replace(temp,request)
+        else:
+            main()
+    finally:
+        win32api.CloseHandle(mutex)
