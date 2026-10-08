@@ -47,7 +47,7 @@ class CorelSession:
                     segments=decode_subpath(p.GetCurveInfo(),self.scale,count,closed)))
         return result
 
-    def snapshot(self, selection_only, progress=None):
+    def snapshot(self, selection_only, progress=None, layers=None):
         self.current()
         shapes = list(self.app.ActiveSelectionRange) if selection_only else list(self.page.Shapes)
         if selection_only and not shapes:
@@ -56,12 +56,14 @@ class CorelSession:
         def visit(items):
             for s in items:
                 name = s.Layer.Name
-                if progress:
-                    progress(name,len(refs))
                 if name.startswith(MARK_PREFIX) or name.strip().upper()=='INFO' or not s.Layer.Visible:
                     continue
                 if s.Type==7:
                     visit(list(s.Shapes));continue
+                if layers is not None and name not in layers:
+                    continue
+                if progress:
+                    progress(name,len(refs))
                 if s.Type not in (1,2,3):
                     skipped.append(int(s.StaticID));continue
                 if s.PowerClip is not None:
@@ -180,7 +182,7 @@ def main():
     import tkinter as tk
     from tkinter import ttk,messagebox
     root=tk.Tk(); root.title('DXF: соединение контуров' if '--join' in sys.argv else 'DXF: проверка векторов')
-    root.geometry('790x640');root.minsize(750,600)
+    root.geometry('790x780');root.minsize(750,720)
     frame=ttk.Frame(root,padding=16);frame.pack(fill='both',expand=True)
     try:session=CorelSession()
     except Exception as error:
@@ -218,6 +220,29 @@ def main():
         selected=tk.BooleanVar(value=bool(session.app.ActiveSelectionRange.Count))
         scope=ttk.Checkbutton(frame,text='Только выделенные (иначе видимые объекты текущей страницы)',variable=selected)
         scope.pack(anchor='w')
+        layer_box=ttk.LabelFrame(frame,text='Какие слои проверять',padding=6)
+        layer_box.pack(fill='x',pady=6)
+        layer_row=ttk.Frame(layer_box);layer_row.pack(fill='x')
+        layer_canvas=tk.Canvas(layer_box,height=85,highlightthickness=0)
+        layer_scroll=ttk.Scrollbar(layer_box,orient='vertical',command=layer_canvas.yview)
+        layer_scroll.pack(side='right',fill='y');layer_canvas.pack(fill='x',expand=True)
+        layer_canvas.configure(yscrollcommand=layer_scroll.set)
+        layer_list=ttk.Frame(layer_canvas)
+        layer_canvas.create_window((0,0),window=layer_list,anchor='nw')
+        layer_list.bind('<Configure>',lambda event:layer_canvas.configure(scrollregion=layer_canvas.bbox('all')))
+        layer_vars={};layer_controls=[]
+        for layer in session.page.Layers:
+            name=layer.Name
+            if not layer.Visible or name.startswith(MARK_PREFIX) or name.strip().upper()=='INFO':continue
+            if name in layer_vars:continue
+            value=tk.BooleanVar(value=True);layer_vars[name]=value
+            button=ttk.Checkbutton(layer_list,text=name,variable=value)
+            index=len(layer_controls);button.grid(row=index//2,column=index%2,sticky='w',padx=(0,24),pady=2)
+            layer_controls.append(button)
+        for caption,value in [('Выбрать все',True),('Снять все',False)]:
+            button=ttk.Button(layer_row,text=caption,command=lambda value=value:[v.set(value) for v in layer_vars.values()])
+            button.pack(side='left',padx=(0,6));layer_controls.append(button)
+        ttk.Label(layer_row,text='Скрытые слои, INFO и метки исключены.').pack(side='left',padx=8)
         settings=ttk.Frame(frame);settings.pack(fill='x',pady=8)
         ttk.Label(settings,text='Допуск проверки кривых, мм:').pack(side='left')
         tolerance=tk.StringVar(value='0,1')
@@ -243,11 +268,11 @@ def main():
                     if command=='stop':return
                     try:
                         if command=='scan':
-                            value,only_selected=data
+                            value,only_selected,checked_layers=data
                             def reading(layer,count):
                                 if cancel_event.is_set():raise InterruptedError('Проверка отменена.')
                                 if count%20==0:messages.put(('reading',(layer,count)))
-                            contours,skipped=worker_session.snapshot(only_selected,reading)
+                            contours,skipped=worker_session.snapshot(only_selected,reading,checked_layers)
                             def report(*args):messages.put(('progress',args))
                             result=audit(contours,tolerance=value,progress=report,cancelled=cancel_event.is_set)
                             messages.put(('result',(result,skipped,len(contours),value)))
@@ -267,21 +292,23 @@ def main():
             except ValueError:raise ValueError('Введите допуск числом, например 0,1 мм.')
             if not math.isfinite(value) or not .001<=value<=1:
                 raise ValueError('Допуск проверки: от 0,001 до 1 мм.')
+            checked_layers={name for name,var in layer_vars.items() if var.get()}
+            if not checked_layers:raise ValueError('Отметьте хотя бы один слой для проверки.')
             state['issues']=[]; tree.delete(*tree.get_children())
             state['busy']=True;cancel_event.clear()
-            for control in (check,marks,clear,scope,tolerance_entry):control.configure(state='disabled')
+            for control in (check,marks,clear,scope,tolerance_entry,*layer_controls):control.configure(state='disabled')
             status.set('Чтение векторов из CorelDRAW…');progress.configure(mode='indeterminate');progress.start()
             cancel.configure(state='normal')
-            commands.put(('scan',(value,selected.get())))
+            commands.put(('scan',(value,selected.get(),checked_layers)))
         def finish():
             state['busy']=False;progress.stop();progress.configure(mode='determinate')
-            for control in (check,clear,scope,tolerance_entry):control.configure(state='normal')
+            for control in (check,clear,scope,tolerance_entry,*layer_controls):control.configure(state='normal')
             marks.configure(state='normal' if state['issues'] else 'disabled')
             cancel.configure(state='disabled')
         def action(command,data=None):
             if state['busy']:return
             state['busy']=True
-            for control in (check,marks,clear,scope,tolerance_entry):control.configure(state='disabled')
+            for control in (check,marks,clear,scope,tolerance_entry,*layer_controls):control.configure(state='disabled')
             status.set('Выполняется действие в CorelDRAW…')
             commands.put((command,data))
         def pick(event=None):
@@ -320,6 +347,11 @@ def main():
         marks=ttk.Button(row,text='Показать метки',command=lambda:action('mark',state['issues']),state='disabled');marks.pack(side='left',padx=6)
         clear=ttk.Button(row,text='Убрать мои метки',command=lambda:action('clear'));clear.pack(side='left')
         cancel=ttk.Button(row,text='Отменить проверку',command=cancel_event.set,state='disabled');cancel.pack(side='right')
+        def invalidate(*args):
+            if state['busy']:return
+            state['issues']=[];tree.delete(*tree.get_children());marks.configure(state='disabled')
+            progress['value']=0;status.set('Параметры изменены. Нажмите «Проверить».')
+        for variable in (*layer_vars.values(),tolerance,selected):variable.trace_add('write',invalidate)
         root.protocol('WM_DELETE_WINDOW',lambda:(cancel_event.set(),commands.put(('stop',None)),root.destroy()))
         ttk.Label(frame,text='Метки — отдельный непечатный слой; в DXF не экспортируются. Сохранение CDR — вручную.',wraplength=710).pack(anchor='w')
         poll()
