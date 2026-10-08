@@ -35,12 +35,19 @@ class CorelSession:
         if not self.app.Documents.Count or self.app.ActiveDocument._oleobj_ != self.doc._oleobj_ or self.doc.ActivePage.Index != self.page.Index:
             raise ValueError('Документ или страница изменились. Откройте проверку заново.')
 
-    def shape_contours(self, shape):
-        return [dict(id=int(shape.StaticID), layer=shape.Layer.Name, closed=bool(p.Closed),
-                     segments=decode_subpath(p.GetCurveInfo(),self.scale,p.Segments.Count,bool(p.Closed)))
-                for p in shape.DisplayCurve.SubPaths if p.Segments.Count]
+    def shape_contours(self, shape, progress=None):
+        sid,layer=int(shape.StaticID),shape.Layer.Name
+        result=[]
+        for number,p in enumerate(shape.DisplayCurve.SubPaths):
+            if progress:progress(layer,number)
+            count=p.Segments.Count
+            if count:
+                closed=bool(p.Closed)
+                result.append(dict(id=sid,layer=layer,closed=closed,
+                    segments=decode_subpath(p.GetCurveInfo(),self.scale,count,closed)))
+        return result
 
-    def snapshot(self, selection_only):
+    def snapshot(self, selection_only, progress=None):
         self.current()
         shapes = list(self.app.ActiveSelectionRange) if selection_only else list(self.page.Shapes)
         if selection_only and not shapes:
@@ -49,6 +56,8 @@ class CorelSession:
         def visit(items):
             for s in items:
                 name = s.Layer.Name
+                if progress:
+                    progress(name,len(refs))
                 if name.startswith(MARK_PREFIX) or name.strip().upper()=='INFO' or not s.Layer.Visible:
                     continue
                 if s.Type==7:
@@ -57,7 +66,7 @@ class CorelSession:
                     skipped.append(int(s.StaticID));continue
                 if s.PowerClip is not None:
                     skipped.append(int(s.StaticID));continue
-                contours.extend(self.shape_contours(s))
+                contours.extend(self.shape_contours(s,progress))
                 refs[int(s.StaticID)]=s
         visit(shapes)
         self.refs, self.contours = refs, contours
@@ -171,17 +180,19 @@ def main():
     import tkinter as tk
     from tkinter import ttk,messagebox
     root=tk.Tk(); root.title('DXF: соединение контуров' if '--join' in sys.argv else 'DXF: проверка векторов')
-    root.geometry('750x520');root.minsize(650,460)
+    root.geometry('790x640');root.minsize(750,600)
     frame=ttk.Frame(root,padding=16);frame.pack(fill='both',expand=True)
     try:session=CorelSession()
     except Exception as error:
         messagebox.showerror('DXF',str(error),parent=root);root.destroy();return
-    status=tk.StringVar(value='Исходные векторы не изменяются при проверке.')
+    status=tk.StringVar(value='Выберите допуск и нажмите «Проверить». Чертёж не изменяется.')
     ttk.Label(frame,textvariable=status,wraplength=710).pack(anchor='w',pady=8)
     def safe(action):
         try:action()
         except Exception as error:messagebox.showerror('DXF',str(error),parent=root)
     if '--join' in sys.argv:
+        status.set('Исходные векторы не изменяются при предпросмотре.')
+        root.minsize(630,350)
         root.geometry('630x350')
         ttk.Label(frame,text='Только выделенные кривые. Предпросмотр не меняет чертёж.').pack(anchor='w',pady=10)
         tolerance=tk.StringVar(value='0,1')
@@ -205,43 +216,111 @@ def main():
         apply=ttk.Button(frame,text='Соединить',command=lambda:safe(join),state='disabled');apply.pack(side='left',padx=8)
     else:
         selected=tk.BooleanVar(value=bool(session.app.ActiveSelectionRange.Count))
-        across=tk.BooleanVar(value=False)
-        ttk.Checkbutton(frame,text='Только выделенные (иначе видимые объекты текущей страницы)',variable=selected).pack(anchor='w')
-        ttk.Checkbutton(frame,text='Искать также между разными слоями',variable=across).pack(anchor='w')
-        ttk.Label(frame,text='INFO и служебные метки пропускаются. Кривые: приближение 0,005 мм;\nпересечения/касания кривых — кандидаты для визуальной проверки.',wraplength=710).pack(anchor='w',pady=6)
+        scope=ttk.Checkbutton(frame,text='Только выделенные (иначе видимые объекты текущей страницы)',variable=selected)
+        scope.pack(anchor='w')
+        settings=ttk.Frame(frame);settings.pack(fill='x',pady=8)
+        ttk.Label(settings,text='Допуск проверки кривых, мм:').pack(side='left')
+        tolerance=tk.StringVar(value='0,1')
+        tolerance_entry=ttk.Entry(settings,textvariable=tolerance,width=10)
+        tolerance_entry.pack(side='left',padx=8)
+        ttk.Label(frame,text='Каждый слой проверяется отдельно. Между слоями пересечения не ищем.\nДопуск задаёт точность кривых: меньше — точнее, но дольше.\nОткрытые концы отмечаются независимо от допуска; автоматического замыкания нет.\nINFO и служебные метки пропускаются. Найденные места нужно проверить визуально.',wraplength=710).pack(anchor='w',pady=6)
+        progress=ttk.Progressbar(frame,maximum=100)
+        progress.pack(fill='x',pady=(0,8))
         tree=ttk.Treeview(frame,columns=('type','layer','x','y'),show='headings',height=11)
         for name,title,width in [('type','Проблема',230),('layer','Слой',170),('x','X, мм',100),('y','Y, мм',100)]:
             tree.heading(name,text=title);tree.column(name,width=width)
         tree.pack(fill='both',expand=True)
-        messages=queue.Queue();state={'issues':[],'busy':False}
+        messages=queue.Queue();commands=queue.Queue();state={'issues':[],'busy':False}
+        cancel_event=threading.Event()
+        def background():
+            import pythoncom
+            pythoncom.CoInitialize()
+            try:
+                # COM references stay in their owning apartment for all operations.
+                worker_session=CorelSession()
+                while True:
+                    command,data=commands.get()
+                    if command=='stop':return
+                    try:
+                        if command=='scan':
+                            value,only_selected=data
+                            def reading(layer,count):
+                                if cancel_event.is_set():raise InterruptedError('Проверка отменена.')
+                                if count%20==0:messages.put(('reading',(layer,count)))
+                            contours,skipped=worker_session.snapshot(only_selected,reading)
+                            def report(*args):messages.put(('progress',args))
+                            result=audit(contours,tolerance=value,progress=report,cancelled=cancel_event.is_set)
+                            messages.put(('result',(result,skipped,len(contours),value)))
+                        else:
+                            if command=='focus':worker_session.focus(data)
+                            elif command=='mark':worker_session.mark(data)
+                            elif command=='clear':worker_session.clear_marks()
+                            messages.put(('action_done',command))
+                    except Exception as error:messages.put(('error',str(error)))
+            except Exception as error:messages.put(('error',str(error)))
+            finally:pythoncom.CoUninitialize()
+        threading.Thread(target=background,daemon=True).start()
         names={'intersection':'Пересечение/касание','overlap':'Наложение','open':'Открытый конец','zero':'Нулевой участок'}
         def scan():
             if state['busy']:return
+            try:value=float(tolerance.get().replace(',','.'))
+            except ValueError:raise ValueError('Введите допуск числом, например 0,1 мм.')
+            if not math.isfinite(value) or not .001<=value<=1:
+                raise ValueError('Допуск проверки: от 0,001 до 1 мм.')
             state['issues']=[]; tree.delete(*tree.get_children())
-            contours,skipped=session.snapshot(selected.get())
-            state['busy']=True;status.set('Проверка…');all_layers=across.get()
-            def work():
-                try:messages.put((audit(contours,all_layers),skipped,None))
-                except Exception as error:messages.put((None,skipped,str(error)))
-            threading.Thread(target=work,daemon=True).start()
+            state['busy']=True;cancel_event.clear()
+            for control in (check,marks,clear,scope,tolerance_entry):control.configure(state='disabled')
+            status.set('Чтение векторов из CorelDRAW…');progress.configure(mode='indeterminate');progress.start()
+            cancel.configure(state='normal')
+            commands.put(('scan',(value,selected.get())))
+        def finish():
+            state['busy']=False;progress.stop();progress.configure(mode='determinate')
+            for control in (check,clear,scope,tolerance_entry):control.configure(state='normal')
+            marks.configure(state='normal' if state['issues'] else 'disabled')
+            cancel.configure(state='disabled')
+        def action(command,data=None):
+            if state['busy']:return
+            state['busy']=True
+            for control in (check,marks,clear,scope,tolerance_entry):control.configure(state='disabled')
+            status.set('Выполняется действие в CorelDRAW…')
+            commands.put((command,data))
         def pick(event=None):
             rows=tree.selection()
-            if rows:safe(lambda:session.focus(state['issues'][int(rows[0])]))
+            if rows:action('focus',state['issues'][int(rows[0])])
         tree.bind('<<TreeviewSelect>>',pick)
         def poll():
-            if not messages.empty():
-                result,skipped,error=messages.get();state['busy']=False
-                if error:status.set(error)
-                else:
+            while not messages.empty():
+                kind,data=messages.get()
+                if kind=='progress':
+                    progress.stop();progress.configure(mode='determinate')
+                    layer,index,total,stage,done,count=data
+                    fraction=done/max(1,count)
+                    portion=(.3*fraction if stage=='Подготовка кривых' else .3+.7*fraction)
+                    progress['value']=100*(index-1+portion)/max(1,total)
+                    status.set(f'Слой {index}/{total}: «{layer}». {stage}: {done}/{count}.')
+                elif kind=='reading':
+                    layer,count=data
+                    status.set(f'Чтение CorelDRAW: слой «{layer}», контур/объект {count+1}…')
+                elif kind=='action_done':
+                    finish();status.set({'focus':'Место выделено и приближено в CorelDRAW.','mark':'Метки добавлены на отдельный непечатный слой.','clear':'Служебные метки удалены.'}[data])
+                elif kind=='error':
+                    finish();status.set(data);progress['value']=0
+                elif kind=='result':
+                    result,skipped,count,value=data
+                    if cancel_event.is_set():
+                        finish();status.set('Проверка отменена. Частичные результаты не показаны.');continue
                     state['issues']=result['issues']
                     for i,issue in enumerate(result['issues']):
                         x,y=issue['point'];tree.insert('', 'end',iid=str(i),values=(str(i+1)+'. '+names[issue['kind']]+(' *' if issue['approx'] else ''),issue['layer'],f'{x:.3f}',f'{y:.3f}'))
-                    status.set(f'Мест для проверки: {len(result["issues"])}. Пропущено объектов: {len(skipped)}. '+('Выберите строку для приближения.' if result['complete'] else 'Достигнут лимит: проверьте меньше объектов, результат НЕ полный.'))
+                    finish();progress['value']=100 if result['complete'] else 0
+                    status.set(f'Проверено контуров: {count}. Допуск: {value:g} мм. Найдено мест: {len(result["issues"])}. Пропущено объектов: {len(skipped)}. '+(('Выберите строку — Corel выделит и приблизит место.' if result['issues'] else 'По проверенным критериям проблем не найдено.') if result['complete'] else 'Достигнут лимит: результат НЕ полный.'))
             root.after(150,poll)
         row=ttk.Frame(frame);row.pack(fill='x',pady=10)
-        ttk.Button(row,text='Проверить',command=lambda:safe(scan)).pack(side='left')
-        ttk.Button(row,text='Показать метки',command=lambda:safe(lambda:session.mark(state['issues']))).pack(side='left',padx=6)
-        ttk.Button(row,text='Убрать мои метки',command=lambda:safe(session.clear_marks)).pack(side='left')
+        check=ttk.Button(row,text='Проверить',command=lambda:safe(scan));check.pack(side='left')
+        marks=ttk.Button(row,text='Показать метки',command=lambda:action('mark',state['issues']),state='disabled');marks.pack(side='left',padx=6)
+        clear=ttk.Button(row,text='Убрать мои метки',command=lambda:action('clear'));clear.pack(side='left')
+        cancel=ttk.Button(row,text='Отменить проверку',command=cancel_event.set,state='disabled');cancel.pack(side='right')
+        root.protocol('WM_DELETE_WINDOW',lambda:(cancel_event.set(),commands.put(('stop',None)),root.destroy()))
         ttk.Label(frame,text='Метки — отдельный непечатный слой; в DXF не экспортируются. Сохранение CDR — вручную.',wraplength=710).pack(anchor='w')
         poll()
     root.mainloop()

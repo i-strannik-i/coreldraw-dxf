@@ -27,10 +27,25 @@ class AuditTests(unittest.TestCase):
         r=audit([contour([(0,0),(10,10),(0,10),(10,0),(0,0)],closed=True)])
         self.assertEqual(len(r['issues']),1)
 
-    def test_layers_separate_unless_requested(self):
+    def test_layers_always_separate(self):
         c=[contour([(0,0),(10,10)]),contour([(0,10),(10,0)],2,layer='V_3')]
         self.assertFalse(audit(c)['issues'])
-        self.assertTrue(audit(c,True)['issues'])
+        self.assertFalse(audit(c,tolerance=1)['issues'])
+
+    def test_tolerance_changes_curve_resolution(self):
+        c=dict(id=1,layer='CUT_ON',closed=False,segments=[('B',[(0,0),(0,10),(10,10),(10,0)])])
+        self.assertGreater(audit([c],tolerance=.001)['segments'],audit([c],tolerance=.1)['segments'])
+
+    def test_invalid_tolerance(self):
+        for value in [0, -1, float('nan'), float('inf'), 2]:
+            with self.assertRaises(ValueError):audit([],tolerance=value)
+
+    def test_cancel_and_progress(self):
+        c=[contour([(0,0),(10,10)])]
+        calls=[]
+        audit(c,progress=lambda *args:calls.append(args))
+        self.assertEqual(calls[0][:3],('CUT_ON',1,1))
+        with self.assertRaises(InterruptedError):audit(c,cancelled=lambda:True)
 
     def test_zero_and_open(self):
         r=audit([contour([(0,0),(0,0),(10,0)],layer='CUT_OUT')])

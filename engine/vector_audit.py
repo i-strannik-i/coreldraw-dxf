@@ -39,7 +39,32 @@ def intersection(a,b,c,d):
     return None
 
 
-def audit(contours, across_layers=False, limit=1000):
+def audit(contours, *, tolerance=.1, limit=1000, progress=None, cancelled=None):
+    if not math.isfinite(tolerance) or not .001 <= tolerance <= 1:
+        raise ValueError('Допуск проверки: от 0,001 до 1 мм.')
+    layers = defaultdict(list)
+    for contour in contours:
+        layers[contour['layer']].append(contour)
+    result = dict(issues=[], complete=True, segments=0, comparisons=0)
+    for index, (layer, items) in enumerate(layers.items()):
+        def report(stage, done, total):
+            if cancelled and cancelled():
+                raise InterruptedError('Проверка отменена. Частичные результаты не показаны.')
+            if progress:
+                progress(layer, index + 1, len(layers), stage, done, total)
+        remaining = limit - len(result['issues'])
+        if remaining <= 0:
+            result['complete'] = False
+            break
+        part = _audit_layer(items, tolerance, remaining, report)
+        result['issues'].extend(part['issues'])
+        result['segments'] += part['segments']
+        result['comparisons'] += part['comparisons']
+        result['complete'] &= part['complete']
+    return result
+
+
+def _audit_layer(contours, tolerance, limit, report):
     issues, seen, spans = [],set(),[]
     def add(kind,point,ids,layer,approx=False):
         key=(kind,tuple(sorted(set(ids))),round(point[0],2),round(point[1],2))
@@ -47,6 +72,7 @@ def audit(contours, across_layers=False, limit=1000):
             seen.add(key)
             issues.append(dict(kind=kind,point=point,ids=sorted(set(ids)),layer=layer,approx=approx))
     for ci,c in enumerate(contours):
+        report('Подготовка кривых', ci, len(contours))
         segs=c['segments']
         if not segs: continue
         if not c['closed'] and requires_closed(c['layer']):
@@ -55,19 +81,23 @@ def audit(contours, across_layers=False, limit=1000):
         for si,(kind,p) in enumerate(segs):
             if all(math.dist(p[0],x)<1e-9 for x in p):
                 add('zero',p[0],[c['id']],c['layer']);continue
-            vertices=[p[0],p[-1]] if kind=='L' else flatten(p)
+            vertices=[p[0],p[-1]] if kind=='L' else flatten(p, tolerance)
             for j,(a,b) in enumerate(zip(vertices,vertices[1:])):
                 if math.dist(a,b)<1e-10:continue
                 spans.append((min(a[0],b[0]),max(a[0],b[0]),min(a[1],b[1]),max(a[1],b[1]),a,b,ci,si,j,kind=='B'))
     spans.sort(key=lambda s:s[0])
     active=[]; comparisons=0; complete=True
-    for s in spans:
+    for number,s in enumerate(spans):
+        if number % 100 == 0:
+            report('Поиск пересечений', number, len(spans))
         active=[t for t in active if t[1]+1e-8>=s[0]]
         for t in active:
             if s[2]>t[3]+1e-8 or t[2]>s[3]+1e-8:continue
             ca,cb=contours[s[6]],contours[t[6]]
-            if not across_layers and ca['layer']!=cb['layer']:continue
+            if ca['layer']!=cb['layer']:continue
             comparisons+=1
+            if comparisons % 10000 == 0:
+                report('Поиск пересечений', number, len(spans))
             if comparisons>3_000_000:
                 complete=False;break
             found=intersection(s[4],s[5],t[4],t[5])
@@ -81,6 +111,7 @@ def audit(contours, across_layers=False, limit=1000):
             add(kind,point,[ca['id'],cb['id']],ca['layer'],s[9] or t[9])
         if not complete:break
         active.append(s)
+    report('Готово',len(spans),len(spans))
     return {'issues':issues,'complete':complete and len(issues)<limit,'segments':len(spans),'comparisons':comparisons}
 
 
