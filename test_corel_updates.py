@@ -40,3 +40,15 @@ class UpdateTests(unittest.TestCase):
     def test_github_offline_falls_back(self):
         with patch.object(u,'github_release',side_effect=OSError('offline')):
             self.assertEqual(u.check_latest(self.folder)['version'],'9.0.0')
+
+    def test_github_uses_public_assets_without_api(self):
+        with patch.object(u,'read_url',return_value=json.dumps(self.info).encode()) as read:
+            result=u.github_release()
+        self.assertTrue(result['available'])
+        self.assertIn('/download/v9.0.0/',result['_url'])
+        self.assertTrue(all('api.github.com' not in call.args[0] for call in read.call_args_list))
+
+    def test_github_changed_manifest_rejected(self):
+        changed=dict(self.info,size=5)
+        with patch.object(u,'read_url',side_effect=[json.dumps(self.info).encode(),json.dumps(changed).encode()]):
+            with self.assertRaises(ValueError):u.github_release()

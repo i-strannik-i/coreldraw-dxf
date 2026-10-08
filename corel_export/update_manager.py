@@ -23,6 +23,7 @@ GITHUB_REPO = 'i-strannik-i/coreldraw-dxf'
 
 def read_url(url, limit):
     if not url.startswith(('https://api.github.com/repos/' + GITHUB_REPO + '/',
+                           'https://github.com/' + GITHUB_REPO + '/releases/latest/download/',
                            'https://github.com/' + GITHUB_REPO + '/releases/download/')):
         raise ValueError('Недопустимый адрес обновления')
     request = urllib.request.Request(url, headers={'User-Agent': 'CorelDXF-Updater', 'Accept': 'application/vnd.github+json'})
@@ -34,18 +35,16 @@ def read_url(url, limit):
 
 
 def github_release():
-    release = json.loads(read_url('https://api.github.com/repos/' + GITHUB_REPO + '/releases/latest', 1024*1024))
-    if release.get('draft') or release.get('prerelease'):
-        raise ValueError('Выпуск ещё не готов к установке')
-    assets = {item['name']: item for item in release.get('assets', [])}
-    info = json.loads(read_url(assets[MANIFEST]['browser_download_url'], 16384))
+    # Public latest-release assets avoid shared-IP GitHub API rate limits.
+    base = 'https://github.com/' + GITHUB_REPO + '/releases/'
+    info = json.loads(read_url(base + 'latest/download/' + MANIFEST, 16384))
     validate_info(info, VERSION)
-    if release['tag_name'] != 'v' + info['version']:
-        raise ValueError('Версия выпуска не совпадает с манифестом')
-    item = assets[info['file']]
-    if item['size'] != info['size']:
-        raise ValueError('Размер выпуска не совпадает')
-    info['_url'] = item['browser_download_url']
+    tagged = base + 'download/v' + info['version'] + '/'
+    pinned = json.loads(read_url(tagged + MANIFEST, 16384))
+    validate_info(pinned, VERSION)
+    if pinned != info:
+        raise ValueError('Выпуск изменился. Повторите проверку обновлений.')
+    info['_url'] = tagged + info['file']
     return info
 
 
