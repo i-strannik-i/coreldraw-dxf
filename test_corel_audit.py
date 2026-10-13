@@ -10,6 +10,25 @@ def contour(points,sid=1,closed=False,layer='CUT_ON'):
 
 
 class AuditTests(unittest.TestCase):
+    def test_open_end_join_is_not_crossing(self):
+        self.assertFalse(audit([contour([(0,0),(10,0)]),contour([(10,0),(20,0)],2)])['issues'])
+        self.assertFalse(audit([contour([(0,0),(10,0),(10,10),(0,0)])])['issues'])
+
+    def test_each_layer_has_independent_limit(self):
+        a=contour([(0,0),(0,0),(10,0)],layer='OUT')
+        b=contour([(0,0),(0,0),(10,0)],2,layer='BACK_OUT')
+        result=audit([a,b],limit=1)
+        self.assertEqual({i['layer'] for i in result['issues']},{'OUT','BACK_OUT'})
+        self.assertFalse(result['complete'])
+    def test_results_follow_category_order(self):
+        c=[contour([(0,0),(0,0),(10,0),(5,0)],layer='CUT_OUT'),
+           contour([(6,-5),(6,5)],2,layer='CUT_OUT'),
+           contour([(6,-5),(6,5)],3,layer='CUT_OUT')]
+        kinds=[i['kind'] for i in audit(c)['issues']]
+        order=['duplicate','zero','overlap','intersection','open']
+        self.assertEqual(set(kinds),set(order))
+        self.assertEqual(kinds,sorted(kinds,key=order.index))
+
     def test_rectangle_no_false_intersections(self):
         result=audit([contour([(0,0),(10,0),(10,10),(0,10),(0,0)],closed=True)])
         self.assertEqual(result['issues'],[])

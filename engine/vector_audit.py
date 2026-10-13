@@ -2,7 +2,9 @@
 import math
 from collections import defaultdict
 from contour_dxf import distance_to_chord, requires_closed
-from duplicate_geometry import duplicate_groups
+from duplicate_geometry import duplicate_groups, duplicate_removals
+
+ISSUE_ORDER = ('duplicate', 'zero', 'overlap', 'intersection', 'open')
 
 
 def flatten(points, error=.005, depth=0):
@@ -53,15 +55,13 @@ def audit(contours, *, tolerance=.1, limit=1000, progress=None, cancelled=None):
                 raise InterruptedError('Проверка отменена. Частичные результаты не показаны.')
             if progress:
                 progress(layer, index + 1, len(layers), stage, done, total)
-        remaining = limit - len(result['issues'])
-        if remaining <= 0:
-            result['complete'] = False
-            break
-        part = _audit_layer(items, tolerance, remaining, report)
+        # Each layer owns its own budget; one busy layer cannot hide the rest.
+        part = _audit_layer(items, tolerance, limit, report)
         result['issues'].extend(part['issues'])
         result['segments'] += part['segments']
         result['comparisons'] += part['comparisons']
         result['complete'] &= part['complete']
+    result['issues'].sort(key=lambda issue: ISSUE_ORDER.index(issue['kind']))
     return result
 
 
@@ -69,20 +69,22 @@ def _audit_layer(contours, tolerance, limit, report):
     issues, seen, spans = [],set(),[]
     report('Поиск дублей',0,len(contours))
     duplicates=duplicate_groups(contours)
-    duplicate_ids={sid:group['keep'] for group in duplicates for sid in group['ids']}
+    whole_copies,partial_copies=duplicate_removals(duplicates)
     issues.extend(duplicates[:limit])
     def add(kind,point,ids,layer,approx=False):
         key=(kind,tuple(sorted(set(ids))),round(point[0],2),round(point[1],2))
         if key not in seen and len(issues)<limit:
             seen.add(key)
             issues.append(dict(kind=kind,point=point,ids=sorted(set(ids)),layer=layer,approx=approx))
+    ordinals=defaultdict(int)
+    retained=[]
     for ci,c in enumerate(contours):
+        subpath=c.get('subpath',ordinals[c['id']]);ordinals[c['id']]+=1
+        if c['id'] in whole_copies or subpath in partial_copies.get(c['id'],set()):continue
+        retained.append(c)
         report('Подготовка кривых', ci, len(contours))
         segs=c['segments']
         if not segs: continue
-        if not c['closed'] and requires_closed(c['layer']):
-            for point in (segs[0][1][0],segs[-1][1][-1]):
-                add('open',point,[c['id']],c['layer'])
         for si,(kind,p) in enumerate(segs):
             if all(math.dist(p[0],x)<1e-9 for x in p):
                 add('zero',p[0],[c['id']],c['layer']);continue
@@ -100,7 +102,6 @@ def _audit_layer(contours, tolerance, limit, report):
             if s[2]>t[3]+1e-8 or t[2]>s[3]+1e-8:continue
             ca,cb=contours[s[6]],contours[t[6]]
             if ca['layer']!=cb['layer']:continue
-            if ca['id']!=cb['id'] and ca['id'] in duplicate_ids and duplicate_ids[ca['id']]==duplicate_ids.get(cb['id']):continue
             comparisons+=1
             if comparisons % 10000 == 0:
                 report('Поиск пересечений', number, len(spans))
@@ -109,6 +110,14 @@ def _audit_layer(contours, tolerance, limit, report):
             found=intersection(s[4],s[5],t[4],t[5])
             if not found:continue
             kind,point=found
+            if kind=='intersection':
+                def open_end(contour,span):
+                    if contour['closed']:return False
+                    segments=contour['segments']
+                    return ((span[7]==0 and math.dist(point,segments[0][1][0])<1e-7) or
+                            (span[7]==len(segments)-1 and math.dist(point,segments[-1][1][-1])<1e-7))
+                # A meeting of open ends is a join candidate, not a crossing.
+                if open_end(ca,s) and open_end(cb,t):continue
             if kind=='intersection' and s[6]==t[6]:
                 n=len(ca['segments'])
                 neighbors=(s[7]==t[7] and abs(s[8]-t[8])<=1) or abs(s[7]-t[7])==1 or (ca['closed'] and {s[7],t[7]}=={0,n-1})
@@ -117,6 +126,13 @@ def _audit_layer(contours, tolerance, limit, report):
             add(kind,point,[ca['id'],cb['id']],ca['layer'],s[9] or t[9])
         if not complete:break
         active.append(s)
+    report('Поиск открытых контуров',0,len(contours))
+    for ci,c in enumerate(retained):
+        report('Поиск открытых контуров',ci,len(contours))
+        segs=c['segments']
+        if segs and not c['closed'] and requires_closed(c['layer']):
+            for point in (segs[0][1][0],segs[-1][1][-1]):
+                add('open',point,[c['id']],c['layer'])
     report('Готово',len(spans),len(spans))
     return {'issues':issues,'complete':complete and len(issues)<limit,'segments':len(spans),'comparisons':comparisons}
 

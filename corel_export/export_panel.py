@@ -15,16 +15,20 @@ except ImportError:
 
 
 class ExportPanel:
-    def __init__(self, parent, prepare, on_busy, on_check):
+    def __init__(self, parent, prepare, on_busy, on_check, preflight=None, cancel_preflight=None):
         self.parent=parent
         self.prepare=prepare
         self.on_busy=on_busy
         self.on_check=on_check
+        self.preflight=preflight
+        self.cancel_preflight=cancel_preflight
+        self.prechecked=None
         self.busy=False
         self.events=queue.Queue()
         self.cancelled=threading.Event()
         self.decision_ready=threading.Event()
         self.accepted=False
+        self.awaiting_confirmation=False
         self.mutex=None
         self.request=None
         self.source=None
@@ -41,6 +45,7 @@ class ExportPanel:
         self.check_button.pack(side='left',padx=8)
         self.cancel_button=ttk.Button(self.actions,text='Отменить',command=self.cancel,state='disabled')
         self.cancel_button.pack(side='right')
+        self.warning_button=ttk.Button(self.actions,text='Экспортировать с предупреждениями',command=lambda:self.choose(True))
         ttk.Label(parent,textvariable=self.stage,wraplength=920).pack(fill='x')
         self.bar=ttk.Progressbar(parent,mode='determinate')
         self.bar.pack(fill='x',pady=8)
@@ -49,9 +54,6 @@ class ExportPanel:
         ttk.Label(self.footer,textvariable=self.elapsed).pack(side='left')
         self.log_button=ttk.Button(self.footer,text='Открыть журнал',command=self.open_log,state='disabled')
         self.log_button.pack(side='right')
-        self.choice=ttk.Frame(parent)
-        ttk.Button(self.choice,text='Вернуться к проверке',command=lambda:self.choose(False)).pack(side='left')
-        ttk.Button(self.choice,text='Экспортировать с предупреждениями',command=lambda:self.choose(True)).pack(side='right')
         self.log_area=ttk.Frame(parent)
         self.log_area.pack(fill='both',expand=True)
         self.text=tk.Text(self.log_area,height=6,wrap='word',font=('Segoe UI',10),state='disabled',padx=8,pady=8)
@@ -64,6 +66,11 @@ class ExportPanel:
         style=ttk.Style(self.parent)
         self.text.configure(background=style.lookup('Treeview','background'),
                             foreground=style.lookup('Treeview','foreground'))
+
+    @property
+    def allows_inspection(self):
+        # The converter has finished using Corel before asking for confirmation.
+        return not self.busy or self.awaiting_confirmation
 
     def append(self, message):
         seconds=int(time.monotonic()-self.started) if self.started else 0
@@ -87,15 +94,39 @@ class ExportPanel:
             return
         self.mutex=handle
         self.request=None;self.source=None;self.log_path=None
+        self.prechecked=None
         self.cancelled.clear();self.decision_ready.clear();self.accepted=False
         self.return_to_check=False;self.last_logged=(None,0)
         self.started=time.monotonic()
+        self.elapsed.set('Прошло 00:00')
         self.text.configure(state='normal');self.text.delete('1.0','end');self.text.configure(state='disabled')
         self.log_button.configure(state='disabled')
         self.busy=True
         try:
             self.on_busy(True)
             self.start_button.configure(state='disabled');self.check_button.configure(state='disabled')
+            if self.preflight is not None:
+                self.stage.set('Общая проверка чертежа перед экспортом…')
+                self.cancel_button.configure(state='normal')
+                self.bar.configure(mode='indeterminate');self.bar.start(20)
+                self.preflight()
+                return
+            self.prepare_conversion()
+        except Exception as error:
+            self.append(str(error));self.finish('Не удалось начать экспорт. DXF не заменён.')
+
+    def preflight_done(self, result=None, error=None):
+        if not self.busy:return
+        if self.cancelled.is_set():
+            self.finish('Экспорт отменён. DXF не заменён.');return
+        if error is not None:
+            self.append(str(error));self.return_to_check=True
+            self.finish('Экспорт остановлен. Результаты во вкладке «Проверка». DXF не заменён.');return
+        self.prechecked=result
+        self.prepare_conversion()
+
+    def prepare_conversion(self):
+        try:
             self.stage.set('Подготовка временной копии чертежа…')
             self.parent.update_idletasks()
             self.request=Path(self.prepare()).resolve(strict=True)
@@ -111,6 +142,9 @@ class ExportPanel:
                 target=Path(target)
             self.target=target
             self.append(f'Экспорт: {target}')
+            if self.prechecked is not None:
+                self.append('Общая проверка '+('использована повторно' if self.prechecked.get('reused') else 'завершена')+
+                    f'. Перенесено дублей: {self.prechecked.get("duplicates_moved",0)}. Найдено мест: {len(self.prechecked["issues"])}. Результаты доступны во вкладке «Проверка».')
             self.append('Область: '+('выделенные объекты.' if scope=='selection' else 'текущая страница.'))
             self.append('Оптимизация: прямые сохраняются прямыми, кривые упрощаются в пределах допуска 0,1 мм. '
                         'Масштаб 1:1, миллиметры. Автоматического замыкания нет.')
@@ -139,7 +173,8 @@ class ExportPanel:
                 if self.cancelled.is_set():return False
             return self.accepted and not self.cancelled.is_set()
         try:
-            result=export_request(self.request,self.target,progress,confirm)
+            options={'prechecked':self.prechecked} if self.prechecked is not None else {}
+            result=export_request(self.request,self.target,progress,confirm,**options)
             self.events.put(('done',result))
         except ConversionCancelled:self.events.put(('cancelled',None))
         except Exception as error:
@@ -151,25 +186,32 @@ class ExportPanel:
     def cancel(self):
         if not self.busy:return
         self.cancelled.set();self.decision_ready.set()
-        self.choice.pack_forget();self.cancel_button.configure(state='disabled')
+        if self.cancel_preflight:self.cancel_preflight()
+        self.awaiting_confirmation=False
+        self.warning_button.pack_forget();self.check_button.configure(state='disabled')
+        self.cancel_button.configure(state='disabled')
         self.stage.set('Отмена: ожидаю завершения текущей операции CorelDRAW…')
 
     def choose(self, accepted):
+        if not self.awaiting_confirmation:return
+        self.awaiting_confirmation=False
         self.accepted=accepted
         self.return_to_check=not accepted
-        self.choice.pack_forget()
+        self.warning_button.pack_forget();self.check_button.configure(state='disabled')
         self.append('Экспорт с предупреждениями подтверждён пользователем.' if accepted else 'Выбран возврат к проверке. DXF не заменён.')
         if not accepted:self.cancelled.set()
         self.decision_ready.set();self.bar.start(20)
 
     def finish(self, message):
         import win32api
-        self.busy=False;self.bar.stop();self.choice.pack_forget()
+        self.busy=False;self.bar.stop();self.warning_button.pack_forget()
+        self.awaiting_confirmation=False
         seconds=int(time.monotonic()-self.started)
         self.elapsed.set(f'Прошло {seconds//60:02d}:{seconds%60:02d}')
         self.bar.configure(mode='determinate',value=0)
         self.stage.set(message)
-        self.start_button.configure(state='normal');self.check_button.configure(state='normal')
+        self.start_button.configure(state='normal')
+        self.check_button.configure(state='normal',text='Перейти к проверке',command=self.on_check)
         self.cancel_button.configure(state='disabled')
         if self.source and self.request and self.source.name=='snapshot.cdr' and self.source.parent==self.request.parent:
             try:self.source.unlink(missing_ok=True)
@@ -189,7 +231,9 @@ class ExportPanel:
             elif kind=='confirm' and not self.cancelled.is_set():
                 self.append('Найдены предупреждения:\n'+data)
                 self.stage.set('DXF ещё не сохранён. Подтвердите экспорт или вернитесь к проверке.')
-                self.bar.stop();self.choice.pack(side='bottom',fill='x',pady=8,before=self.log_area)
+                self.bar.stop();self.awaiting_confirmation=True
+                self.check_button.configure(state='normal',text='Вернуться к проверке',command=lambda:self.choose(False))
+                self.warning_button.pack(side='right',padx=(0,8))
             elif kind in ('done','cancelled','error'):
                 if kind=='done':
                     message=data.get('check_status','DXF сохранён')

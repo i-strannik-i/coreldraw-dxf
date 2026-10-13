@@ -51,13 +51,17 @@ def progress_text(label, info):
     return label + (': ' + details if details else '')
 
 
-def export_request(request, target, progress, confirm_warnings=None):
+def export_request(request, target, progress, confirm_warnings=None, *, prechecked=None):
     from convert_cdr import convert
     from save_outputs import publish_file
     source, _, scope, page = read_request(request)
     if Path(target).suffix.lower() != '.dxf':
         raise ValueError('Выходной файл должен иметь расширение .dxf.')
-    report = convert(source, Path(request).parent / 'output', .1, progress, .1, page_index=page, connected=True, check_vectors=True)
+    if prechecked is not None and (not prechecked.get('complete') or any(i['kind']=='zero' for i in prechecked['issues'])):
+        raise GeometryBlocked('Общая проверка не пройдена. Результаты во вкладке «Проверка». DXF не сохранён.')
+    report = convert(source, Path(request).parent / 'output', .1, progress, .1, page_index=page, connected=True, check_vectors=prechecked is None)
+    if prechecked is not None:
+        report['vector_check'] = prechecked
     validation = report.get('validation', {})
     open_warning = validation_message({'open_required': validation.get('open_required', [])})
     if open_warning:
@@ -79,7 +83,7 @@ def export_request(request, target, progress, confirm_warnings=None):
         counts = Counter((issue['layer'], issue['kind']) for issue in warnings)
         names = {'intersection': 'пересечения/касания', 'overlap': 'наложения', 'duplicate': 'группы дублей'}
         summary = '\n'.join(f'{layer}: {names[kind]} — {count}' for (layer, kind), count in sorted(counts.items()))
-        summary += '\nЭто места для визуальной проверки, а не подтверждённые дефекты. Допуск проверки: 0,1 мм.'
+        summary += f'\nЭто места для визуальной проверки, а не подтверждённые дефекты. Допуск проверки: {check.get("tolerance_mm", .1):g} мм.'
         if confirm_warnings is None or not confirm_warnings(summary):
             from import_progress import ConversionCancelled
             raise ConversionCancelled('Экспорт с предупреждениями не подтверждён. DXF не заменён.')

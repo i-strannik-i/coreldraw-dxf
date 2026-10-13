@@ -1,4 +1,4 @@
-"""Corel vector inspection and explicit, undoable joining; no silent repairs."""
+"""Corel inspection with automatic duplicate quarantine and undoable joining."""
 import hashlib
 import json
 import math
@@ -15,16 +15,22 @@ if not getattr(sys, 'frozen', False):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'engine'))
 from corel_geometry import decode_subpath
 from vector_audit import audit, ambiguous_endpoints
-from duplicate_geometry import duplicate_groups, DUPLICATE_PREFIX
+from duplicate_geometry import duplicate_groups, duplicate_removals, DUPLICATE_PREFIX
 from marker_layout import place_label
+from route_order import join_summary
+from continuous_vectors import continuous_vectors, continuous_summary, corel_segments
+try:
+    from .corel_performance import paused_redraw
+except ImportError:
+    from corel_performance import paused_redraw
 
 MARK_PREFIX = '_DXF_CHECK_'
 ISSUE_STYLES = {
+    'duplicate': ('Дубли', 'Копии автоматически переносятся на технические слои', '#27733a'),
     'zero': ('Нулевой участок', 'Блокирует экспорт', '#c5363d'),
     'overlap': ('Наложение', 'Предупреждение: проверьте визуально', '#7843a3'),
     'intersection': ('Пересечение / касание', 'Предупреждение: проверьте визуально', '#a65300'),
     'open': ('Открытый контур', 'Предупреждение, экспорт разрешён', '#006a9e'),
-    'duplicate': ('Дубли', 'Полностью совпадающие объекты одного слоя', '#27733a'),
 }
 
 
@@ -47,7 +53,7 @@ def check_summary(result, count, skipped, tolerance, selected, layers):
 def excluded_layer(name):
     name=name.strip().upper()
     return name.startswith((MARK_PREFIX,DUPLICATE_PREFIX)) or name in {
-        'INFO','GUIDES','GUIDELINES','DESKTOP','DOCUMENT GRID','GRID',
+        'INFO','#','GUIDES','GUIDELINES','DESKTOP','DOCUMENT GRID','GRID',
         'НАПРАВЛЯЮЩИЕ','РАБОЧИЙ СТОЛ','СЕТКА ДОКУМЕНТА','СЕТКА',
     }
 
@@ -103,7 +109,7 @@ class CorelSession:
             count=p.Segments.Count
             if count:
                 closed=bool(p.Closed)
-                result.append(dict(id=sid,layer=layer,closed=closed,
+                result.append(dict(id=sid,layer=layer,subpath=number,closed=closed,
                     segments=decode_subpath(p.GetCurveInfo(),self.scale,count,closed)))
         return result
 
@@ -139,19 +145,37 @@ class CorelSession:
     def digest(contours):
         return hashlib.sha256(json.dumps(contours,sort_keys=True).encode()).hexdigest()
 
-    def unchanged(self):
+    def unchanged(self,progress=None):
         self.current()
         try:
-            now=[c for s in self.refs.values() for c in self.shape_contours(s)]
+            now=[]
+            for index,s in enumerate(self.refs.values()):
+                if progress:progress('Проверка исходной геометрии',index,len(self.refs))
+                now.extend(self.shape_contours(s))
+            if progress:progress('Проверка исходной геометрии',len(self.refs),len(self.refs))
         except Exception as error:
             raise ValueError('Объекты изменились. Повторите проверку.') from error
         if self.digest(now)!=self.signature:
             raise ValueError('Геометрия или слои изменились. Повторите проверку.')
 
     def focus(self, issue):
-        self.unchanged()
+        # Navigation only depends on the objects participating in this issue.
+        # Re-reading every curve here made each click wait for a full snapshot.
+        self.current()
+        ids=set(issue['ids'])
+        try:
+            shapes=[self.refs[sid] for sid in sorted(ids)]
+            if any(not shape.Layer.Visible for shape in shapes):
+                raise ValueError('Слой скрыт.')
+            now=[c for shape in shapes for c in self.shape_contours(shape)]
+            expected=[c for c in self.contours if c['id'] in ids]
+            ordered=lambda contours:sorted(contours,key=lambda c:(c['id'],c.get('subpath',0)))
+            if not expected or self.digest(ordered(now))!=self.digest(ordered(expected)):
+                raise ValueError('Геометрия изменилась.')
+        except Exception as error:
+            raise ValueError('Объекты выбранного места изменились или недоступны. Повторите проверку.') from error
         selected=self.app.CreateShapeRange()
-        for sid in issue['ids']:selected.Add(self.refs[sid])
+        for shape in shapes:selected.Add(shape)
         selected.CreateSelection()
         x,y=issue['point']; width=30/self.scale
         self.doc.ActiveWindow.ActiveView.SetViewArea(x/self.scale-width/2,y/self.scale-width/2,width,width)
@@ -179,8 +203,14 @@ class CorelSession:
 
     def mark(self, issues, cancelled=None):
         self.unchanged()
+        with paused_redraw(self.app):
+            self._replace_marks(issues,cancelled)
+
+    def _replace_marks(self, issues, cancelled=None):
         old_layers=self.marker_layers()
         if not issues and not old_layers:return
+        selection=[shape for shape in self.app.ActiveSelectionRange
+                   if not shape.Layer.Name.startswith(MARK_PREFIX)]
         def check_cancel():
             if cancelled and cancelled():raise InterruptedError('Проверка отменена. Прежние метки сохранены.')
         check_cancel()
@@ -222,6 +252,9 @@ class CorelSession:
             for old in old_layers:
                 old.Editable=True;changed=True
                 old.Delete()
+            restored=self.app.CreateShapeRange()
+            for shape in selection:restored.Add(shape)
+            restored.CreateSelection()
         except Exception:
             self.doc.EndCommandGroup()
             if changed:self.doc.Undo()
@@ -230,13 +263,28 @@ class CorelSession:
             self.doc.EndCommandGroup()
             self.mark_layer=layer
 
-    def move_duplicates(self, groups):
+    def move_duplicates(self, groups, preserve_selection=False):
         self.unchanged()
         expected=duplicate_groups(self.contours)
         order=lambda group:(group['layer'],group['keep'])
         if not groups or sorted(groups,key=order)!=sorted(expected,key=order):
             raise ValueError('Список дублей устарел. Повторите полную проверку.')
-        copies=[self.refs[sid] for group in groups for sid in group['copies']]
+        copy_ids,partial=duplicate_removals(groups)
+        count=sum(len(group['copies']) for group in groups)
+        plans={}
+        for sid,indexes in partial.items():
+            shape=self.refs[sid]
+            if shape.Type!=3:
+                raise ValueError('Для переноса части объекта сначала преобразуйте его в кривые.')
+            keep_curve=self.app.CreateCurve(self.doc)
+            copy_curve=self.app.CreateCurve(self.doc)
+            for index,path in enumerate(shape.Curve.SubPaths):
+                (copy_curve if index in indexes else keep_curve).AppendCurve(path.GetCopy())
+            if not keep_curve.SubPaths.Count:copy_ids.add(sid)
+            else:plans[sid]=(keep_curve,copy_curve)
+        copies=[self.refs[sid] for sid in sorted(copy_ids|set(partial))]
+        selection=[shape for shape in self.app.ActiveSelectionRange
+                   if int(shape.StaticID) not in copy_ids] if preserve_selection else None
         for shape in copies:
             if shape.ParentGroup is not None or shape.Locked or not shape.Layer.Editable:
                 raise ValueError('Есть дубли в группе или заблокированные объекты. Проверьте их вручную; ничего не перенесено.')
@@ -249,11 +297,22 @@ class CorelSession:
                 if original not in layers:
                     target=self.page.CreateLayer(DUPLICATE_PREFIX+'__'+original+'__'+uuid.uuid4().hex[:8])
                     changed=True;target.Printable=False;layers[original]=target
-                shape.MoveToLayer(layers[original])
+                sid=int(shape.StaticID)
+                if sid in plans:
+                    keep_curve,copy_curve=plans[sid]
+                    isolated=shape.Duplicate(0,0)
+                    isolated.Curve.CopyAssign(copy_curve)
+                    isolated.MoveToLayer(layers[original])
+                    shape.Curve.CopyAssign(keep_curve)
+                else:
+                    shape.MoveToLayer(layers[original])
             for layer in self.marker_layers():
                 layer.Editable=True;layer.Delete()
             originals=self.app.CreateShapeRange()
-            for group in groups:originals.Add(self.refs[group['keep']])
+            if selection is not None:
+                for shape in selection:originals.Add(shape)
+            else:
+                for group in groups:originals.Add(self.refs[group['keep']])
             originals.CreateSelection()
         except Exception:
             self.doc.EndCommandGroup()
@@ -261,56 +320,180 @@ class CorelSession:
             raise
         else:self.doc.EndCommandGroup()
         self.refs={};self.contours=[]
-        return len(copies)
+        return count
 
-    def prepare_join(self,tolerance):
+    def quarantine_duplicates(self, cancelled=None):
+        """Preserve the original scan scope, even when moving changes selection."""
+        groups = duplicate_groups(self.contours)
+        if cancelled and cancelled():
+            raise InterruptedError('Проверка отменена до переноса дублей.')
+        if not groups:
+            return 0
+        copies,partial = duplicate_removals(groups)
+        for sid,indexes in partial.items():
+            if len(indexes)==sum(c['id']==sid for c in self.contours):copies.add(sid)
+        remaining = [c for c in self.contours if c['id'] not in copies]
+        refs = {sid:shape for sid,shape in self.refs.items() if sid not in copies}
+        count = self.move_duplicates(groups, preserve_selection=True)
+        if partial:
+            remaining=[c for sid,shape in refs.items() for c in
+                       (self.shape_contours(shape) if sid in partial else
+                        [old for old in remaining if old['id']==sid])]
+        self.contours, self.refs = remaining, refs
+        self.signature = self.digest(remaining)
+        return count
+
+    def join_selection(self):
+        """Keep selected containers separate from the curves they contain."""
+        self.current()
+        roots=list(self.app.ActiveSelectionRange)
+        leaves={}
+        def visit(shapes):
+            for shape in shapes:
+                layer=shape.Layer
+                if excluded_layer(layer.Name):continue
+                if not layer.Visible or not layer.Editable or shape.PowerClip is not None:
+                    raise ValueError('Выделите только доступные рабочие кривые одного слоя.')
+                if shape.Type==7:
+                    visit(list(shape.Shapes))
+                elif shape.Type in (1,2,3) and shape.Fill.Type==0:
+                    leaves[int(shape.StaticID)]=shape
+                else:
+                    raise ValueError('Для соединения нужны кривые без заливки, в том числе внутри групп.')
+        visit(roots)
+        return roots,leaves
+
+    def prepare_join(self,tolerance,refresh=True,optimize_path=False):
         if not math.isfinite(tolerance) or not 0<tolerance<=1:
             raise ValueError('Допуск должен быть больше 0 и не больше 1 мм.')
-        self.snapshot(True)
-        if not self.refs:raise ValueError('Нет выбранных кривых.')
+        if refresh or not hasattr(self,'join_source'):
+            self.join_source=None
+            roots,leaves=self.join_selection()
+            _,skipped=self.snapshot(True)
+            if skipped or set(leaves)!=set(self.refs):
+                raise ValueError('Выделите только рабочие кривые одного слоя.')
+            self.join_roots={int(s.StaticID):s for s in roots}
+            self.join_leaf_ids=set(leaves)
+            if len({s.Layer.Name for s in leaves.values()})>1:
+                raise ValueError('Соединяйте по одному слою, с одинаковыми цветом и толщиной линии.')
+            open_ids={c['id'] for c in self.contours if not c['closed']}
+            self.join_open_refs={sid:s for sid,s in self.refs.items() if sid in open_ids}
+        else:
+            self.current()
+        if not self.refs:raise ValueError('В выделении нет контуров.')
         # Combining across layers or appearances could erase production semantics.
-        styles=set()
-        for s in self.refs.values():
-            if s.Type!=3 or s.Fill.Type!=0:
+        styles=set();style_groups={}
+        for s in (self.refs if optimize_path else self.join_open_refs).values():
+            if s.Type not in ((1,2,3) if optimize_path else (3,)) or s.Fill.Type!=0:
                 raise ValueError('Для соединения выделите кривые без заливки. Прямоугольники и текст сначала преобразуйте в кривые вручную.')
             color=s.Outline.Color.GetCopy();color.ConvertToRGB()
-            styles.add((s.Layer.Name,s.Outline.Type,s.Outline.Width,color.RGBRed,color.RGBGreen,color.RGBBlue))
-        if len(styles)!=1:raise ValueError('Соединяйте по одному слою, с одинаковыми цветом и толщиной линии.')
-        if ambiguous_endpoints(self.contours,tolerance):
+            style=(s.Layer.Name,s.Outline.Type,s.Outline.Width,color.RGBRed,color.RGBGreen,color.RGBBlue)
+            styles.add(style);style_groups.setdefault(style,[]).append(s)
+        if len(styles)>1 and not optimize_path:raise ValueError('Соединяйте по одному слою, с одинаковыми цветом и толщиной линии.')
+        self.join_network_summary=None
+        if optimize_path:
+            plan=dict(routes=[],connectors=0,max_connector=0)
+            route_sources=[]
+            for sources in style_groups.values():
+                ids={int(s.StaticID) for s in sources}
+                part=continuous_vectors([c for c in self.contours if c['id'] in ids],tolerance,self.scale)
+                plan['routes'].extend(part['routes'])
+                plan['connectors']+=part['connectors']
+                plan['max_connector']=max(plan['max_connector'],part['max_connector'])
+                route_sources.extend([sources[0]]*len(part['routes']))
+            before=(sum(c['closed'] for c in self.contours),sum(not c['closed'] for c in self.contours))
+            after=(sum(r['closed'] for r in plan['routes']),sum(not r['closed'] for r in plan['routes']))
+            outputs=[]
+            for source,route in zip(route_sources,plan['routes']):
+                route['segments']=corel_segments(route['segments'],self.scale)
+                curve=self.app.CreateCurve(self.doc)
+                def units(p):return p[0]/self.scale,p[1]/self.scale
+                path=curve.CreateSubPath(*units(route['segments'][0][1][0]))
+                for kind,p in route['segments']:
+                    if kind=='L':path.AppendLineSegment(*units(p[-1]))
+                    else:path.AppendCurveSegment2(*units(p[-1]),*units(p[1]),*units(p[2]))
+                if route['closed']:path.Closed=True
+                outputs.append((source,curve))
+            self.join_outputs=outputs;self.join_delete_refs=self.refs
+            self.join_route=None;self.join_warning='';self.join_network=plan
+            self.join_changed=bool(outputs)
+            self.join_network_summary=continuous_summary(before,after,plan)
+            self.join_counts=(before,after)
+            if len(styles)>1:self.join_network_summary+=f'\nРазное оформление: {len(styles)} групп, обработаны отдельно.'
+            return before,after
+        ambiguous=ambiguous_endpoints(self.contours,tolerance)
+        self.join_warning='Соединение пропущено: у концов несколько соседей в допуске.' if ambiguous else ''
+        if ambiguous and not optimize_path:
             raise ValueError('У некоторых концов больше одного соседа в допуске. Соединение неоднозначно: выделите меньше объектов или уменьшите допуск.')
-        curve=self.app.CreateCurve(self.doc)
-        for s in self.refs.values():curve.AppendCurve(s.Curve)
+        if self.join_source is None:
+            self.join_source=self.app.CreateCurve(self.doc)
+            for s in self.join_open_refs.values():self.join_source.AppendCurve(s.DisplayCurve)
+        curve=self.join_source.GetCopy()
         before=(sum(c['closed'] for c in self.contours),sum(not c['closed'] for c in self.contours))
-        curve.JoinTouchingSubpaths(True,tolerance/self.scale)
-        after=(sum(bool(p.Closed) for p in curve.SubPaths),sum(not p.Closed for p in curve.SubPaths))
+        if self.join_open_refs and not ambiguous:curve.JoinTouchingSubpaths(True,tolerance/self.scale)
+        untouched=sum(c['id'] not in self.join_open_refs for c in self.contours)
+        after=(untouched+sum(bool(p.Closed) for p in curve.SubPaths),sum(not p.Closed for p in curve.SubPaths))
         self.joined=curve
+        self.join_outputs=[(next(iter(self.join_open_refs.values())),curve)] if self.join_open_refs else []
+        self.join_delete_refs=self.join_open_refs
+        self.join_route=None
+        self.join_changed=before!=after
+        self.join_counts=(before,after)
         return before,after
 
-    def apply_join(self):
-        self.unchanged()
-        if {int(s.StaticID) for s in self.app.ActiveSelectionRange} != set(self.refs):
+    def apply_join(self,progress=None):
+        report=progress or (lambda *args:None)
+        report('Проверка исходной геометрии',0,len(self.refs))
+        self.unchanged(progress)
+        report('Проверка выделения',0,0)
+        roots,leaves=self.join_selection()
+        if {int(s.StaticID) for s in roots} != set(self.join_roots) or set(leaves)!=self.join_leaf_ids:
             raise ValueError('Выделение изменилось. Пересчитайте предпросмотр соединения.')
+        with paused_redraw(self.app):
+            self._apply_join(report)
+            report('Обновление окна CorelDRAW',0,0)
+
+    def _apply_join(self,progress=None):
+        report=progress or (lambda *args:None)
         # Undo includes both the replacement and removal of the selected originals.
         self.doc.BeginCommandGroup('Соединить контуры DXF')
         changed=False
         try:
-            result=next(iter(self.refs.values())).Duplicate(0,0)
-            changed=True
-            result.Curve.CopyAssign(self.joined)
+            results=self.app.CreateShapeRange()
+            previous=None
+            report('Создание векторов',0,len(self.join_outputs))
+            for index,(source,curve) in enumerate(self.join_outputs,1):
+                result=source.Layer.CreateCurve(curve)
+                changed=True
+                result.Fill.ApplyNoFill()
+                result.Outline.CopyAssign(source.Outline)
+                result.Name=source.Name
+                if previous is not None:result.OrderBackOf(previous)
+                results.Add(result)
+                previous=result
+                report('Создание векторов',index,len(self.join_outputs))
             originals=self.app.CreateShapeRange()
-            for s in self.refs.values():originals.Add(s)
+            report('Подготовка замены исходных объектов',0,len(self.join_delete_refs))
+            for index,s in enumerate(self.join_delete_refs.values(),1):
+                originals.Add(s)
+                report('Подготовка замены исходных объектов',index,len(self.join_delete_refs))
+            report('Замена исходных объектов',0,0)
             originals.Delete()
-            result.CreateSelection()
+            report('Обновление выделения',0,0)
+            results.CreateSelection()
+            report('Удаление прежних меток',0,0)
             for layer in self.marker_layers():
                 layer.Editable=True
                 layer.Delete()
         except Exception:
+            report('Отмена незавершённых изменений',0,0)
             self.doc.EndCommandGroup()
             if changed:self.doc.Undo()
             raise
         else:
             self.doc.EndCommandGroup()
         self.refs={}
+        self.join_source=None
 
 
 def main():
@@ -320,10 +503,12 @@ def main():
         from .ui_shell import apply_theme, load_theme, save_theme, feedback, THEMES
         from .version import VERSION
         from .export_panel import ExportPanel
+        from .check_pipeline import SharedCheck
     except ImportError:
         from ui_shell import apply_theme, load_theme, save_theme, feedback, THEMES
         from version import VERSION
         from export_panel import ExportPanel
+        from check_pipeline import SharedCheck
     root=tk.Tk(); root.title('CorelDRAW → DXF · '+VERSION+' beta')
     root.geometry('790x780');root.minsize(750,720)
     frame=ttk.Frame(root,padding=16);frame.pack(fill='both',expand=True)
@@ -340,11 +525,14 @@ def main():
     notebook=ttk.Notebook(frame);notebook.pack(fill='both',expand=True)
     export_tab=ttk.Frame(notebook,padding=20)
     check_tab=ttk.Frame(notebook,padding=12)
+    join_tab=ttk.Frame(notebook,padding=20)
     help_tab=ttk.Frame(notebook,padding=20)
-    notebook.add(export_tab,text='Экспорт');notebook.add(check_tab,text='Проверка');notebook.add(help_tab,text='Слои и помощь')
+    notebook.add(export_tab,text='Экспорт');notebook.add(check_tab,text='Проверка')
+    notebook.add(join_tab,text='Оптимизация');notebook.add(help_tab,text='Слои и помощь')
     notebook.select(check_tab if '--check' in sys.argv or '--join' in sys.argv else export_tab)
+    if '--join' in sys.argv:notebook.select(join_tab)
     if '--help' in sys.argv:notebook.select(help_tab)
-    status=tk.StringVar(value='Готово. Проверка не изменяет исходные векторы.')
+    status=tk.StringVar(value='Готово. При проверке копии дублей переносятся на технические слои. Отмена переноса — в CorelDRAW.')
     ttk.Label(frame,textvariable=status,wraplength=1000,style='Muted.TLabel').pack(side='bottom',anchor='w',pady=(10,0),before=notebook)
     frame=check_tab
     def safe(action):
@@ -416,60 +604,49 @@ def main():
         apply=ttk.Button(frame,text='Соединить',command=lambda:safe(join),state='disabled');apply.pack(side='left',padx=8)
     else:
         root.geometry('1080x800');root.minsize(1000,760)
-        body=ttk.Frame(frame);body.pack(fill='both',expand=True,pady=(8,0))
-        layer_box=ttk.LabelFrame(body,text='Слои для проверки',padding=10)
-        layer_box.pack(side='left',fill='y',padx=(0,16))
-        frame=ttk.Frame(body);frame.pack(side='left',fill='both',expand=True)
-        selected=tk.BooleanVar(value=bool(session.app.ActiveSelectionRange.Count))
-        scope=ttk.Checkbutton(frame,text='Только выделенные (иначе видимые объекты текущей страницы)',variable=selected)
-        scope.pack(anchor='w')
-        layer_row=ttk.Frame(layer_box);layer_row.pack(fill='x')
-        layer_count=tk.StringVar()
-        ttk.Label(layer_box,textvariable=layer_count).pack(anchor='w',pady=(10,8))
-        ttk.Label(layer_box,text='Технические и скрытые слои,\nINFO и метки исключены.\nВ CDR ничего не удаляется.',wraplength=210).pack(side='bottom',anchor='w',pady=(10,0))
-        layer_area=ttk.Frame(layer_box);layer_area.pack(fill='both',expand=True)
-        layer_canvas=tk.Canvas(layer_area,width=190,highlightthickness=0)
-        layer_scroll=ttk.Scrollbar(layer_area,orient='vertical',command=layer_canvas.yview)
-        layer_scroll.pack(side='right',fill='y');layer_canvas.pack(side='left',fill='both',expand=True)
-        layer_canvas.configure(yscrollcommand=layer_scroll.set)
-        layer_list=ttk.Frame(layer_canvas)
-        layer_canvas.create_window((0,0),window=layer_list,anchor='nw')
-        layer_list.bind('<Configure>',lambda event:layer_canvas.configure(scrollregion=layer_canvas.bbox('all')))
-        def wheel(event):layer_canvas.yview_scroll(-int(event.delta/120),'units')
-        layer_canvas.bind('<MouseWheel>',wheel);layer_list.bind('<MouseWheel>',wheel)
-        layer_vars={};layer_controls=[]
-        for layer in session.page.Layers:
-            name=layer.Name
-            if not layer.Visible or excluded_layer(name) or layer.Shapes.Count == 0:continue
-            if name in layer_vars:continue
-            value=tk.BooleanVar(value=True);layer_vars[name]=value
-            button=ttk.Checkbutton(layer_list,text=name,variable=value)
-            index=len(layer_controls);button.grid(row=index,column=0,sticky='w',padx=(0,8),pady=6)
-            button.bind('<MouseWheel>',wheel)
-            layer_controls.append(button)
-        for caption,value in [('Выбрать все',True),('Снять все',False)]:
-            button=ttk.Button(layer_row,text=caption,command=lambda value=value:[v.set(value) for v in layer_vars.values()])
-            button.pack(side='left',padx=(0,6));layer_controls.append(button)
-        layer_count.set(f'Выбрано: {len(layer_vars)} из {len(layer_vars)}')
-        join_box=ttk.LabelFrame(frame,text='Соединение и замыкание · только выделенные кривые одного слоя',padding=10)
-        join_box.pack(side='bottom',fill='x',pady=(12,0))
+        check_scope=tk.StringVar(value='page')
+        check_scope_row=ttk.Frame(frame);check_scope_row.pack(fill='x',pady=(8,4))
+        check_scope_controls=[]
+        for caption,value in [('Весь текущий лист','page'),('Только выделенное','selection')]:
+            option=ttk.Radiobutton(check_scope_row,text=caption,variable=check_scope,value=value)
+            option.pack(side='left',padx=(0,20));check_scope_controls.append(option)
+        ttk.Label(frame,text='Каждый слой проверяется отдельно. Выделение задаётся в CorelDRAW.',wraplength=950).pack(anchor='w',pady=(0,4))
+        ttk.Label(frame,text='Скрытые и технические слои, INFO, # и метки исключены.',style='Muted.TLabel').pack(anchor='w',pady=(0,8))
+        ttk.Label(join_tab,text='Оптимизация',style='Title.TLabel').pack(anchor='w',pady=(0,12))
+        ttk.Label(join_tab,text='Выделите кривые или группы одного слоя. Пересчёт — автоматически.\nСоединение объединяет близкие концы. Замыкание выполняется только в пределах допуска.\nИзменения — по кнопке «Применить». Отмена применённого изменения — Ctrl+Z.',wraplength=900).pack(anchor='w',pady=(0,16))
+        join_box=ttk.Frame(join_tab)
+        join_box.pack(fill='x')
         join_fields=ttk.Frame(join_box);join_fields.pack(fill='x')
         ttk.Label(join_fields,text='Допуск, мм:').pack(side='left')
         join_tolerance=tk.StringVar(value='0,1')
         join_entry=ttk.Entry(join_fields,textvariable=join_tolerance,width=8)
         join_entry.pack(side='left',padx=8)
-        join_text=tk.StringVar(value='Выделите кривые и нажмите\n«Пересчитать выделение».')
-        ttk.Label(join_fields,textvariable=join_text,wraplength=390).pack(side='left',padx=10)
+        join_optimize=tk.BooleanVar(value=False)
+        join_optimize_control=ttk.Checkbutton(join_fields,text='Объединить в непрерывные векторы',variable=join_optimize)
+        join_optimize_control.pack(side='left',padx=16)
+        ttk.Label(join_box,text='С галочкой участки соединяются на пересечениях без повторного прохода.\nНовые соединения — только в пределах допуска. Слои INFO и # игнорируются.',wraplength=950,style='Muted.TLabel').pack(anchor='w',pady=(10,4))
+        join_text=tk.StringVar(value='Выделите кривые одного слоя в CorelDRAW.')
+        join_preview_box=ttk.Frame(join_box,height=160);join_preview_box.pack(fill='x');join_preview_box.pack_propagate(False)
+        ttk.Label(join_preview_box,textvariable=join_text,wraplength=650,justify='left').pack(anchor='w',pady=8)
+        join_stage=tk.StringVar(value='')
+        join_elapsed=tk.StringVar(value='')
+        join_report=tk.StringVar(value='')
+        join_stage_row=ttk.Frame(join_box);join_stage_row.pack(fill='x')
+        ttk.Label(join_stage_row,textvariable=join_stage).pack(side='left')
+        ttk.Label(join_stage_row,textvariable=join_elapsed).pack(side='right')
+        join_progress=ttk.Progressbar(join_box,maximum=100)
+        join_progress.pack(fill='x',pady=(5,6))
+        ttk.Label(join_box,textvariable=join_report,wraplength=950,justify='left').pack(anchor='w')
         settings=ttk.Frame(frame);settings.pack(fill='x',pady=8)
         ttk.Label(settings,text='Допуск проверки кривых, мм:').pack(side='left')
         tolerance=tk.StringVar(value='0,1')
         tolerance_entry=ttk.Entry(settings,textvariable=tolerance,width=10)
         tolerance_entry.pack(side='left',padx=8)
-        ttk.Label(frame,text='Проверка по слоям. Пересечения и касания требуют визуального подтверждения.',style='Muted.TLabel',wraplength=710).pack(anchor='w',pady=6)
+        ttk.Label(frame,text='Сначала копии дублей автоматически переносятся на технические слои. Затем проверяются оставшиеся векторы. Перенос можно отменить в CorelDRAW.',style='Muted.TLabel',wraplength=710).pack(anchor='w',pady=6)
         legend=ttk.Frame(frame)
         legend.pack(fill='x',pady=(2,10))
         filter_buttons={}
-        filter_names={'zero':'Нулевые','overlap':'Наложения','intersection':'Пересечения','open':'Открытые','duplicate':'Дубли'}
+        filter_names={'duplicate':'Дубли','zero':'Нулевые','overlap':'Наложения','intersection':'Пересечения','open':'Открытые'}
         for index,kind in enumerate(filter_names):
             control=ttk.Button(legend,text=filter_names[kind]+' · 0',style=kind+'.TButton',command=lambda kind=kind:filter_issues(kind))
             control.grid(row=0,column=index,sticky='ew',padx=(0,6));legend.columnconfigure(index,weight=1)
@@ -506,6 +683,7 @@ def main():
             tree.delete(*tree.get_children())
             for kind,control in filter_buttons.items():
                 count=sum(len(issue['copies']) if kind=='duplicate' else 1 for issue in state['issues'] if issue['kind']==kind)
+                if kind=='duplicate':count=state.get('duplicates_moved',0)
                 control.configure(text=filter_names[kind]+f' · {count}'+(' ✓' if state['filter']==kind else ''))
             for i,issue in enumerate(state['issues']):
                 if state['filter'] and issue['kind']!=state['filter']:continue
@@ -516,6 +694,8 @@ def main():
             if state['busy']:return
             state['filter']=None if state['filter']==kind else kind
             render_issues()
+            if kind=='duplicate':
+                status.set(f'Перенесено копий: {state.get("duplicates_moved",0)}. Они находятся на непечатных слоях _DXF_DUPLICATES и исключены из дальнейшей проверки и DXF.')
         cancel_event=threading.Event()
         def background():
             import pythoncom
@@ -523,42 +703,48 @@ def main():
             try:
                 # COM references stay in their owning apartment for all operations.
                 worker_session=CorelSession()
+                shared_check=SharedCheck(worker_session)
                 join_session=CorelSession()
                 while True:
                     command,data=commands.get()
                     if command=='stop':return
                     try:
                         if command=='join_preview':
-                            revision,value=data
+                            revision,value,geometry_revision,optimize_path=data
                             try:
-                                before,after=join_session.prepare_join(value)
-                                messages.put(('join_preview',(revision,before,after,None)))
+                                refresh=geometry_revision!=getattr(join_session,'preview_revision',None)
+                                before,after=join_session.prepare_join(value,refresh,optimize_path)
+                                join_session.preview_revision=geometry_revision
+                                summary=join_session.join_network_summary or join_summary(before,after,value,join_session.join_route)
+                                if join_session.join_warning:summary+='\n'+join_session.join_warning
+                                messages.put(('join_preview',(revision,summary,join_session.join_changed,None)))
                             except Exception as error:
                                 messages.put(('join_preview',(revision,None,None,str(error))))
                         elif command=='join_apply':
-                            join_session.apply_join()
-                            messages.put(('join_applied',None))
-                        elif command=='move_duplicates':
-                            count=worker_session.move_duplicates(data)
-                            messages.put(('duplicates_moved',count))
-                        elif command=='scan':
+                            started=time.monotonic()
+                            join_session.apply_join(lambda *data:messages.put(('join_apply_progress',data)))
+                            before,after=join_session.join_counts
+                            messages.put(('join_applied',(before,after,time.monotonic()-started)))
+                        elif command in ('scan','export_check'):
                             value,only_selected,checked_layers,update_marks=data
                             def reading(layer,count):
                                 if cancel_event.is_set():raise InterruptedError('Проверка отменена.')
                                 if count%20==0:messages.put(('reading',(layer,count)))
-                            contours,skipped=worker_session.snapshot(only_selected,reading,checked_layers)
                             def report(*args):messages.put(('progress',args))
-                            result=audit(contours,tolerance=value,progress=report,cancelled=cancel_event.is_set)
-                            messages.put(('marking',None))
+                            payload=shared_check.run(value,only_selected,checked_layers,cancel_event.is_set,
+                                reading,report,lambda count:messages.put(('duplicates_moved',count)))
+                            result=dict(payload['result'])
+                            if update_marks:messages.put(('marking',None))
                             result['marks_updated']=worker_session.refresh_marks(result,cancel_event.is_set) if update_marks else False
-                            result['after_join']=not update_marks
-                            messages.put(('result',(result,skipped,len(contours),value)))
+                            result['after_join']=command=='scan' and not update_marks
+                            payload['result']=result
+                            messages.put(('export_result' if command=='export_check' else 'result',payload))
                         else:
                             if command=='focus':worker_session.focus(data)
-                            elif command=='mark':worker_session.mark(data)
+                            elif command=='mark':worker_session.mark(data,cancel_event.is_set)
                             elif command=='clear':worker_session.clear_marks()
                             messages.put(('action_done',command))
-                    except Exception as error:messages.put(('error',str(error)))
+                    except Exception as error:messages.put(('export_error' if command=='export_check' else 'error',str(error)))
             except Exception as error:messages.put(('error',str(error)))
             finally:pythoncom.CoUninitialize()
         threading.Thread(target=background,daemon=True).start()
@@ -569,33 +755,63 @@ def main():
             except ValueError:raise ValueError('Введите допуск числом, например 0,1 мм.')
             if not math.isfinite(value) or not .001<=value<=1:
                 raise ValueError('Допуск проверки: от 0,001 до 1 мм.')
-            checked_layers={name for name,var in layer_vars.items() if var.get()}
-            if not checked_layers:raise ValueError('Отметьте хотя бы один слой для проверки.')
-            state['issues']=[]; render_issues()
-            state['complete']=False;duplicate_button.configure(state='disabled')
-            state['scan_scope']=(selected.get(),set(checked_layers))
+            state['issues']=[];state['duplicates_moved']=0; render_issues()
+            state['complete']=False
+            selection_only=check_scope.get()=='selection'
+            state['scan_scope']=(selection_only,None)
             state['scanning']=True
             record_check('Проверка выполняется. Итог ещё не получен.')
             state['busy']=True;cancel_event.clear()
-            join_apply.configure(state='disabled');join_refresh.configure(state='disabled');join_entry.configure(state='disabled')
-            for control in (check,marks,clear,scope,tolerance_entry,*layer_controls):control.configure(state='disabled')
+            join_apply.configure(state='disabled');join_cancel.configure(state='disabled');join_entry.configure(state='disabled');join_optimize_control.configure(state='disabled')
+            for control in (check,marks,clear,tolerance_entry,*check_scope_controls):control.configure(state='disabled')
             status.set('Чтение векторов из CorelDRAW…');progress.configure(mode='indeterminate');progress.start()
             cancel.configure(state='normal')
-            commands.put(('scan',(value,selected.get(),checked_layers,update_marks)))
+            commands.put(('scan',(value,selection_only,None,update_marks)))
+        def export_preflight():
+            if state['busy']:raise ValueError('Дождитесь завершения текущей операции.')
+            value=float(tolerance.get().replace(',','.'))
+            if not math.isfinite(value) or not .001<=value<=1:
+                raise ValueError('Допуск проверки: от 0,001 до 1 мм.')
+            state['scanning']=True;state['busy']=True;state['complete']=False
+            state['filter']=None
+            record_check('Общая проверка перед экспортом: сверка чертежа и параметров…')
+            cancel_event.clear()
+            for control in (check,marks,clear,tolerance_entry,join_apply,join_cancel,join_entry,join_optimize_control,*check_scope_controls):
+                control.configure(state='disabled')
+            progress.configure(mode='indeterminate');progress.start()
+            commands.put(('export_check',(value,export_scope.get()=='selection',None,False)))
+        exporter.preflight=export_preflight
+        exporter.cancel_preflight=cancel_event.set
         def finish():
             state['busy']=False;progress.stop();progress.configure(mode='determinate')
-            for control in (check,clear,scope,tolerance_entry,*layer_controls):control.configure(state='normal')
-            marks.configure(state='normal' if state['issues'] else 'disabled')
-            duplicate_button.configure(state='normal' if state.get('complete') and any(i['kind']=='duplicate' for i in state['issues']) else 'disabled')
+            edit_state='disabled' if exporter.busy else 'normal'
+            for control in (check,clear,tolerance_entry,*check_scope_controls):control.configure(state=edit_state)
+            marks.configure(state='normal' if state['issues'] and not exporter.busy else 'disabled')
             cancel.configure(state='disabled')
-            join_refresh.configure(state='normal');join_entry.configure(state='normal')
+            join_cancel.configure(state=edit_state);join_entry.configure(state=edit_state);join_optimize_control.configure(state=edit_state)
+        original_export_busy=exporter.on_busy
+        def shared_export_busy(busy):
+            original_export_busy(busy)
+            if not busy and not state['busy']:finish()
+        exporter.on_busy=shared_export_busy
         def action(command,data=None):
-            if state['busy'] or exporter.busy:return
+            if state['busy']:return
+            if exporter.busy and not (command=='focus' and exporter.allows_inspection):
+                if command=='focus':status.set('Дождитесь подготовки DXF. При просмотре предупреждений переход к найденным местам будет доступен.')
+                return
+            cancel_event.clear()
             state['busy']=True
-            duplicate_button.configure(state='disabled')
-            join_apply.configure(state='disabled');join_refresh.configure(state='disabled');join_entry.configure(state='disabled')
-            for control in (check,marks,clear,scope,tolerance_entry,*layer_controls):control.configure(state='disabled')
-            status.set('Выполняется действие в CorelDRAW…')
+            join_apply.configure(state='disabled');join_cancel.configure(state='disabled');join_entry.configure(state='disabled');join_optimize_control.configure(state='disabled')
+            for control in (check,marks,clear,tolerance_entry,*check_scope_controls):control.configure(state='disabled')
+            if command=='join_preview':
+                join_entry.configure(state='normal');join_cancel.configure(state='normal');join_optimize_control.configure(state='normal')
+            if command=='join_apply':
+                join_state['applying']=True;join_state['started']=time.monotonic()
+                join_stage.set('Начинаю применение…');join_elapsed.set('Прошло 00:00')
+                join_report.set('')
+                join_progress.configure(mode='indeterminate');join_progress.start()
+            status.set('Переход к выбранному месту…' if command=='focus' else 'Выполняется действие в CorelDRAW…')
+            if command=='mark':cancel.configure(state='normal')
             commands.put((command,data))
         def pick(event=None):
             rows=tree.selection()
@@ -604,80 +820,111 @@ def main():
         def poll():
             while not messages.empty():
                 kind,data=messages.get()
-                if kind=='progress':
+                if kind=='join_geometry_changed':
+                    schedule_join_geometry()
+                elif kind=='progress':
                     progress.stop();progress.configure(mode='determinate')
                     layer,index,total,stage,done,count=data
                     fraction=done/max(1,count)
                     portion=(.3*fraction if stage=='Подготовка кривых' else .3+.7*fraction)
                     progress['value']=100*(index-1+portion)/max(1,total)
                     status.set(f'Слой {index}/{total}: «{layer}». {stage}: {done}/{count}.')
+                    if exporter.busy and exporter.request is None:exporter.stage.set(status.get())
                 elif kind=='reading':
                     layer,count=data
                     status.set(f'Чтение CorelDRAW: слой «{layer}», контур/объект {count+1}…')
+                    if exporter.busy and exporter.request is None:exporter.stage.set(status.get())
                 elif kind=='marking':
                     status.set('Обновление меток на чертеже… Прежние метки заменяются, а не накапливаются.')
+                elif kind=='quarantining':
+                    status.set('Поиск дублей и перенос копий на технические слои…')
                 elif kind=='action_done':
                     finish();status.set({'focus':'Место выделено и приближено в CorelDRAW.','mark':'Метки добавлены на отдельный непечатный слой.','clear':'Служебные метки удалены.'}[data])
-                elif kind=='error':
+                elif kind in ('error','export_error'):
                     finish();status.set(data);progress['value']=0
+                    if join_state.get('applying'):
+                        join_state['applying']=False;join_progress.stop();join_progress.configure(mode='determinate',value=0)
+                        join_stage.set('Применение не завершено')
+                        join_report.set('Ошибка: '+data)
                     if state.pop('scanning',False):
-                        record_check('Проверка НЕ завершена. '+data+' Отсутствие ошибок не подтверждено.')
+                        record_check('Проверка НЕ завершена. '+data+' Отсутствие ошибок не подтверждено.'+f' Перенесено дублей: {state.get("duplicates_moved",0)}; перенос можно отменить в CorelDRAW.')
                     join_apply.configure(state='disabled')
+                    if kind=='export_error' or exporter.busy and exporter.request is None:
+                        exporter.preflight_done(error=data)
                 elif kind=='join_preview':
-                    revision,before,after,error=data
+                    revision,summary,changed,error=data
                     finish()
                     if revision!=join_state['revision']:
-                        schedule_join()
+                        pass  # A newer change already scheduled its own preview.
                     elif error:
                         join_text.set(error)
                     else:
-                        join_text.set(f'До: замкнутых {before[0]},\nоткрытых {before[1]}\nПосле: замкнутых {after[0]},\nоткрытых {after[1]}')
+                        join_text.set(summary)
                         join_state['ready']=revision
-                        join_apply.configure(state='normal' if before!=after else 'disabled')
+                        join_apply.configure(state='normal' if changed else 'disabled')
                         status.set('Предпросмотр готов. Векторы не изменены. Кнопка применения подтверждает соединение.')
+                elif kind=='join_apply_progress':
+                    stage,done,total=data
+                    join_stage.set(stage+(f': {done} / {total}' if total else '…'))
+                    join_progress.stop()
+                    if total:join_progress.configure(mode='determinate',value=100*done/total)
+                    else:join_progress.configure(mode='indeterminate');join_progress.start()
                 elif kind=='join_applied':
+                    before,after,seconds=data
+                    join_state['applying']=False
+                    join_progress.stop();join_progress.configure(mode='determinate',value=100)
+                    join_stage.set('Применение завершено')
+                    join_elapsed.set(f'Время: {int(seconds)//60:02d}:{int(seconds)%60:02d}')
+                    join_report.set(f'Выполнено: {sum(before)} → {sum(after)} векторов. Замкнутых: {after[0]}, открытых: {after[1]}.\nОтмена результата — Ctrl+Z в CorelDRAW. Чертёж автоматически не сохранён.')
                     finish();join_state['ready']=None
                     join_text.set('Соединение применено.\nОтмена: Ctrl+Z в CorelDRAW.')
                     join_apply.configure(state='disabled')
-                    safe(lambda:scan(False))
+                    invalidate()
+                    schedule_join_geometry()
                 elif kind=='duplicates_moved':
-                    state['issues']=[];state['complete']=False;render_issues();finish()
-                    progress['value']=0
-                    record_check(f'Перенесено копий: {data}. Оригиналы оставлены на исходных слоях.\nСлои _DXF_DUPLICATES исключены из DXF. Отмена: Ctrl+Z. Повторите проверку.')
-                    status.set('Дубли перенесены, ничего не удалено. Ctrl+Z отменяет весь перенос. CDR не сохранён автоматически.')
-                elif kind=='result':
-                    result,skipped,count,value=data
+                    state['duplicates_moved']=data;render_issues()
+                    if data:record_check(f'Перенесено дублей: {data}. Проверка остальных векторов продолжается. Перенос сохранится при отмене проверки; его можно отменить в CorelDRAW.')
+                elif kind in ('result','export_result'):
+                    result,skipped,count,value=data['result'],data['skipped'],data['count'],data['tolerance']
+                    check_scope.set('selection' if data['selection'] else 'page')
+                    state['scan_scope']=(data['selection'],data['layers'])
+                    state['duplicates_moved']=data['duplicates_moved']
                     state['scanning']=False
                     state['complete']=result['complete']
-                    record_check(check_summary(result,count,skipped,value,*state['scan_scope']))
+                    record_check(('Использован результат: чертёж и параметры не изменились.\n' if data['reused'] else '')+check_summary(result,count,skipped,value,*state['scan_scope'])+f'\nПеренесено дублей: {state.get("duplicates_moved",0)}.')
                     state['issues']=result['issues']
                     render_issues()
                     finish();progress['value']=100 if result['complete'] else 0
                     status.set(f'Проверено контуров: {count}. Допуск: {value:g} мм. Найдено мест: {len(result["issues"])}. Пропущено объектов: {len(skipped)}. '+(('Выберите строку — Corel выделит и приблизит место.' if result['issues'] else 'По проверенным критериям проблем не найдено.') if result['complete'] else 'Достигнут лимит: результат НЕ полный.'))
                     status.set(status.get()+(' После соединения: «Показать метки» добавит метки. Ctrl+Z отменяет соединение.' if result.get('after_join') else (' Метки обновлены.' if result['marks_updated'] else ' Прежние метки сохранены.')))
+                    if kind=='export_result':
+                        error=None
+                        if not result['complete']:error='Проверка не завершена. Экспорт остановлен.'
+                        elif skipped:error='Есть непроверенные объекты. Экспорт остановлен; проверьте журнал.'
+                        elif any(i['kind']=='zero' for i in result['issues']):error='Обнаружены нулевые участки. Исправьте их во вкладке «Проверка».'
+                        exporter.preflight_done(dict(result,duplicates_moved=data['duplicates_moved'],reused=data['reused']),error)
+                        if exporter.busy:
+                            notebook.tab(check_tab,state='normal')
+                            for control in (check,marks,clear,tolerance_entry,join_apply,join_cancel,join_entry,join_optimize_control,*check_scope_controls):
+                                control.configure(state='disabled')
+                            status.set('Выполняется экспорт. Результаты общей проверки доступны. Не редактируйте чертёж до завершения операции.')
+            if exporter.busy and exporter.request is None:
+                seconds=int(time.monotonic()-exporter.started)
+                exporter.elapsed.set(f'Прошло {seconds//60:02d}:{seconds%60:02d}')
+            if join_state.get('applying'):
+                seconds=int(time.monotonic()-join_state['started'])
+                join_elapsed.set(f'Прошло {seconds//60:02d}:{seconds%60:02d}')
             root.after(150,poll)
         row=ttk.Frame(frame);row.pack(side='bottom',fill='x',pady=10,before=tree)
         check=ttk.Button(row,text='Проверить',style='Accent.TButton',command=lambda:safe(scan));check.pack(side='left')
         marks=ttk.Button(row,text='Показать метки',command=lambda:action('mark',state['issues']),state='disabled');marks.pack(side='left',padx=6)
         clear=ttk.Button(row,text='Убрать мои метки',command=lambda:action('clear'));clear.pack(side='left')
         cancel=ttk.Button(row,text='Отменить проверку',command=cancel_event.set,state='disabled');cancel.pack(side='right')
-        def transfer_duplicates():
-            if state['busy'] or exporter.busy or not state.get('complete'):return
-            groups=[i for i in state['issues'] if i['kind']=='duplicate']
-            count=sum(len(i['copies']) for i in groups)
-            if count and messagebox.askyesno('Перенос дублей',
-                f'Перенести лишних копий: {count}, групп: {len(groups)}?\n'
-                'По одному оригиналу останется на исходном слое. Проверяется геометрия, не цвет или заливка.\n'
-                'Копии попадут в отдельные непечатные слои _DXF_DUPLICATES с именем исходного слоя. '
-                'Эти слои не экспортируются. Ничего не удаляется. Отмена всего переноса: Ctrl+Z.',parent=root):
-                action('move_duplicates',groups)
-        duplicate_button=ttk.Button(layer_box,text='Перенести дубли',command=transfer_duplicates,state='disabled')
-        duplicate_button.pack(side='bottom',fill='x',pady=6,before=layer_area)
-        join_state={'revision':0,'ready':None,'timer':None}
+        join_state={'revision':0,'geometry_revision':0,'ready':None,'timer':None,'cancelled':False}
         def preview_join():
             join_state['timer']=None
             if state['busy'] or exporter.busy:
-                join_state['timer']=root.after(400,preview_join)
+                join_state['timer']=root.after(100,preview_join)
                 return
             try:
                 value=float(join_tolerance.get().replace(',','.'))
@@ -685,41 +932,79 @@ def main():
             except ValueError:
                 join_text.set('Введите допуск больше 0\nи не больше 1 мм.');return
             join_text.set('Пересчитываю…')
-            action('join_preview',(join_state['revision'],value))
+            action('join_preview',(join_state['revision'],value,join_state['geometry_revision'],join_optimize.get()))
         def schedule_join(*args):
+            join_state['cancelled']=False
             join_state['revision']+=1;join_state['ready']=None
             join_apply.configure(state='disabled')
             if join_state['timer'] is not None:root.after_cancel(join_state['timer'])
-            join_state['timer']=root.after(400,preview_join)
+            if notebook.select()==str(join_tab):join_state['timer']=root.after(150,preview_join)
+            else:join_state['timer']=None
+        def schedule_join_geometry(*args):
+            join_state['geometry_revision']+=1
+            schedule_join()
+        def cancel_join_preview():
+            join_state['revision']+=1;join_state['ready']=None;join_state['cancelled']=True
+            if join_state['timer'] is not None:root.after_cancel(join_state['timer'])
+            join_state['timer']=None
+            join_apply.configure(state='disabled')
+            join_text.set('Предпросмотр отменён. Чертёж не изменён.')
+            status.set('Предпросмотр отменён. Новое выделение или допуск запустит пересчёт.')
         def apply_join_preview():
             if state['busy'] or join_state['ready']!=join_state['revision']:return
             action('join_apply')
-        join_refresh=ttk.Button(join_box,text='Пересчитать выделение',command=schedule_join)
-        join_refresh.pack(side='left',pady=(8,0))
-        join_apply=ttk.Button(join_box,text='Применить соединение и замыкание',command=apply_join_preview,state='disabled')
-        join_apply.pack(side='right',pady=(8,0))
+        join_apply=ttk.Button(join_box,text='Применить',command=apply_join_preview,state='disabled')
+        join_apply.pack(side='left',pady=(16,0))
+        join_cancel=ttk.Button(join_box,text='Отменить',command=cancel_join_preview)
+        join_cancel.pack(side='left',padx=8,pady=(16,0))
         join_tolerance.trace_add('write',schedule_join)
+        join_optimize.trace_add('write',schedule_join)
+        notebook.bind('<<NotebookTabChanged>>',lambda event:schedule_join_geometry() if notebook.select()==str(join_tab) else None)
+        import pythoncom,win32com.client
+        class JoinEvents:
+            # COM can deliver events inside a native Tk message dispatch. Never
+            # re-enter Tk from that callback; the normal UI poll handles updates.
+            def changed(self,*args):messages.put(('join_geometry_changed',None))
+            OnSelectionChange=changed
+            OnShapeChange=changed
+            OnShapeTransform=changed
+            OnShapeMove=changed
+            OnShapeDelete=changed
+            OnShapeCreate=changed
+            OnShapeDistort=changed
+            OnLayerChange=changed
+            OnPageActivate=changed
+        join_events=win32com.client.WithEvents(session.doc,JoinEvents)
+        def pump_join_events():
+            pythoncom.PumpWaitingMessages()
+            root.after(100,pump_join_events)
+        root.after(100,pump_join_events)
+        if notebook.select()==str(join_tab):schedule_join_geometry()
         def invalidate(*args):
             if state['busy']:return
-            layer_count.set(f'Выбрано: {sum(v.get() for v in layer_vars.values())} из {len(layer_vars)}')
-            state['issues']=[];render_issues();marks.configure(state='disabled')
-            state['complete']=False;duplicate_button.configure(state='disabled')
+            state['issues']=[];state['duplicates_moved']=0;render_issues();marks.configure(state='disabled')
+            state['complete']=False
             progress['value']=0;status.set('Параметры изменены. Нажмите «Проверить».')
             check_result.set('Параметры изменены. Нужна новая проверка. Предыдущие итоги доступны в истории.')
-        for variable in (*layer_vars.values(),tolerance,selected):variable.trace_add('write',invalidate)
+        tolerance.trace_add('write',invalidate)
+        check_scope.trace_add('write',invalidate)
         closing=[False]
         def close_window():
             if exporter.busy:
                 if not closing[0]:exporter.cancel();closing[0]=True
                 root.after(100,close_window)
                 return
+            if state['busy']:
+                cancel_event.set();root.after(100,close_window)
+                return
             cancel_event.set();commands.put(('stop',None));root.destroy()
+            join_events.close()
         root.protocol('WM_DELETE_WINDOW',close_window)
         ttk.Label(frame,text='Метки не печатаются и не входят в DXF. Сохранение CDR — вручную.',style='Muted.TLabel',wraplength=710).pack(side='bottom',anchor='w',before=tree)
         poll()
         def refresh_theme(event=None):
             name='dark' if theme_value.get()=='Тёмная' else 'light'
-            apply_theme(root,name,tree,layer_canvas)
+            apply_theme(root,name,tree)
             exporter.theme()
             try:save_theme(name)
             except OSError:status.set('Не удалось сохранить тему. В текущем окне она применена.')
@@ -733,7 +1018,7 @@ def main():
                 if stamp!=last_request[0]:
                     last_request[0]=stamp
                     data=json.loads(request.read_text(encoding='utf-8'))
-                    tab={'export':export_tab,'check':check_tab,'help':help_tab}.get(data.get('tab'))
+                    tab={'export':export_tab,'check':check_tab,'join':join_tab,'help':help_tab}.get(data.get('tab'))
                     if tab is not None and abs(time.time()-data.get('created',0))<10:
                         notebook.select(export_tab if exporter.busy else tab);root.deiconify();root.lift()
             except (OSError,ValueError,TypeError):pass
@@ -751,7 +1036,7 @@ if __name__=='__main__':
         if win32api.GetLastError()==winerror.ERROR_ALREADY_EXISTS:
             request=Path(os.environ['LOCALAPPDATA'])/'SkladCorelDXF/open-tab.json'
             request.parent.mkdir(parents=True,exist_ok=True)
-            mode='check' if '--check' in sys.argv or '--join' in sys.argv else ('help' if '--help' in sys.argv else 'export')
+            mode='join' if '--join' in sys.argv else ('check' if '--check' in sys.argv else ('help' if '--help' in sys.argv else 'export'))
             temp=request.with_name('open-tab-'+str(os.getpid())+'.tmp')
             temp.write_text(json.dumps({'tab':mode,'created':time.time()}),encoding='utf-8')
             os.replace(temp,request)

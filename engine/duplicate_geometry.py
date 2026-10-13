@@ -48,4 +48,34 @@ def duplicate_groups(contours):
         ids=sorted(ids)
         groups.append(dict(kind='duplicate',layer=layer,ids=ids,keep=ids[0],copies=ids[1:],
                            point=objects[(layer,ids[0])][0]['segments'][0][1][0],approx=False))
+    # A combined Corel curve can contain repeated subpaths even when the object
+    # as a whole has no identical copy. Do not count whole-object copies twice.
+    whole_copies={(group['layer'],sid) for group in groups for sid in group['copies']}
+    paths=defaultdict(list)
+    ordinals=defaultdict(int)
+    for contour in contours:
+        sid=contour['id'];layer=contour['layer']
+        index=contour.get('subpath',ordinals[(layer,sid)])
+        ordinals[(layer,sid)]+=1
+        if (layer,sid) in whole_copies or not contour['segments']:continue
+        paths[(layer,contour_key(contour))].append((sid,index,contour))
+    for (layer,_),parts in paths.items():
+        if len(parts)<2:continue
+        parts.sort(key=lambda part:(part[0],part[1]))
+        members=[{'id':sid,'subpath':index} for sid,index,_ in parts]
+        groups.append(dict(kind='duplicate',mode='subpaths',layer=layer,
+            ids=sorted({sid for sid,_,_ in parts}),keep=parts[0][0],
+            copies=[sid for sid,_,_ in parts[1:]],members=members,
+            point=parts[0][2]['segments'][0][1][0],approx=False))
     return groups
+
+
+def duplicate_removals(groups):
+    """Whole object IDs and per-object subpath indexes to quarantine."""
+    whole=set();partial=defaultdict(set)
+    for group in groups:
+        if group.get('mode')=='subpaths':
+            for member in group['members'][1:]:
+                partial[member['id']].add(member['subpath'])
+        else:whole.update(group['copies'])
+    return whole,dict(partial)

@@ -7,7 +7,12 @@ import importlib.metadata
 root = Path(__file__).resolve().parent
 package = root / 'package' / 'CorelDXF_2024'
 package.mkdir(parents=True, exist_ok=True)
-shutil.copytree(root / 'dist' / 'CorelDXF', package / 'runtime', dirs_exist_ok=True)
+runtime = (package / 'runtime').resolve()
+if not runtime.is_relative_to((root / 'package').resolve()):
+    raise RuntimeError('Runtime staging path is outside the package directory')
+if runtime.exists():
+    shutil.rmtree(runtime)
+shutil.copytree(root / 'dist' / 'CorelDXF', runtime)
 shutil.copytree(root / 'icons', package / 'icons', dirs_exist_ok=True)
 for name in ('SkladCorelDXF.gms', 'README_RU.txt', 'ExportDXF.bas', 'HotkeyBridge.bas', 'ContourCheck.bas'):
     shutil.copy2(root / name, package / name)

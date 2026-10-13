@@ -6,6 +6,23 @@ from corel_export.export_dxf import read_request, export_request, GeometryBlocke
 
 
 class CorelExportTests(unittest.TestCase):
+    def test_shared_check_skips_second_vector_audit_but_keeps_conversion_validation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source=Path(folder)/'snapshot.cdr';source.touch()
+            request=Path(folder)/'request.txt';target=Path(folder)/'output.dxf'
+            request.write_text(f'{source}\n{target}\npage\n',encoding='utf-16')
+            check={'complete':True,'issues':[{'kind':'intersection','layer':'CUT'}],'tolerance_mm':.2}
+            with patch('convert_cdr.convert',return_value={'dxf':'converted.dxf'}) as convert, patch('save_outputs.publish_file') as publish:
+                publish.return_value=None
+                result=export_request(request,target,lambda *a,**kw:None,lambda summary:True,prechecked=check)
+                self.assertFalse(convert.call_args.kwargs['check_vectors'])
+                self.assertIs(result['vector_check'],check)
+                publish.assert_called_once()
+            with patch('convert_cdr.convert',return_value={'validation':{'zero_length':[{'layer':'CUT'}]}}), patch('save_outputs.publish_file') as publish:
+                with self.assertRaises(GeometryBlocked):
+                    export_request(request,target,lambda *a,**kw:None,prechecked=check)
+                publish.assert_not_called()
+
     def test_progress_labels_are_readable(self):
         self.assertEqual(progress_text('Оптимизация', dict(layer='D4', segments=12)),
                          'Оптимизация: Слой: D4 | Сегментов: 12')

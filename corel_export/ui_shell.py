@@ -49,8 +49,12 @@ def apply_theme(root, name, tree=None, canvas=None):
     style.configure('Accent.TButton', background=p['accent'], foreground='#ffffff' if name=='light' else '#10242a')
     style.map('Accent.TButton',background=[('active',p['accent'])],foreground=[('disabled',p['muted']),('active','#ffffff' if name=='light' else '#10242a')])
     style.configure('TCheckbutton', padding=4)
+    for control in ('TCheckbutton','TRadiobutton'):
+        style.configure(control,background=p['bg'],foreground=p['text'])
+        style.map(control,
+                  background=[('disabled',p['bg']),('pressed',p['selected']),('active',p['selected']),('focus',p['selected'])],
+                  foreground=[('disabled',p['muted']),('pressed',p['text']),('active',p['text']),('focus',p['text'])])
     style.configure('Horizontal.TProgressbar', background=p['accent'], troughcolor=p['panel'], bordercolor=p['line'], lightcolor=p['accent'], darkcolor=p['accent'])
-    style.map('TCheckbutton', background=[('active',p['selected'])])
     style.configure('TEntry', fieldbackground=p['panel'], foreground=p['text'], padding=5, insertcolor=p['text'])
     style.configure('TCombobox', fieldbackground=p['panel'], foreground=p['text'], padding=5)
     style.map('TCombobox', fieldbackground=[('readonly',p['panel'])], foreground=[('readonly',p['text'])])
