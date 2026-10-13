@@ -734,7 +734,7 @@ def main():
         ttk.Label(frame,text='Каждый слой проверяется отдельно. Выделение задаётся в CorelDRAW.',wraplength=950).pack(anchor='w',pady=(0,4))
         ttk.Label(frame,text='Скрытые и технические слои, INFO, # и метки исключены.',style='Muted.TLabel').pack(anchor='w',pady=(0,8))
         ttk.Label(join_tab,text='Оптимизация',style='Title.TLabel').pack(anchor='w',pady=(0,12))
-        ttk.Label(join_tab,text='Выберите весь лист или выделенные объекты. Каждый слой обрабатывается отдельно. Пересчёт — автоматически.\nСоединение объединяет близкие концы. Замыкание выполняется только в пределах допуска.\nДубли автоматически переносятся на технические слои до расчёта. Соединение — по «Применить». Отмена — Ctrl+Z.',wraplength=900).pack(anchor='w',pady=(0,16))
+        ttk.Label(join_tab,text='Выберите весь лист или выделенные объекты. Каждый слой обрабатывается отдельно. Проверка и расчёт — по кнопке «Проверить».\nСоединение объединяет близкие концы. Замыкание выполняется только в пределах допуска.\nДубли автоматически переносятся на технические слои до расчёта. Соединение — по «Применить». Отмена — Ctrl+Z.',wraplength=900).pack(anchor='w',pady=(0,16))
         join_box=ttk.Frame(join_tab)
         join_box.pack(fill='x')
         join_fields=ttk.Frame(join_box);join_fields.pack(fill='x')
@@ -746,13 +746,13 @@ def main():
         join_optimize_control=ttk.Checkbutton(join_fields,text='Объединить в непрерывные векторы',variable=join_optimize)
         join_optimize_control.pack(side='left',padx=16)
         ttk.Label(join_box,text='С галочкой участки соединяются на пересечениях без повторного прохода.\nНовые соединения — только в пределах допуска. Слои INFO и # игнорируются.',wraplength=950,style='Muted.TLabel').pack(anchor='w',pady=(10,4))
-        join_scope=tk.StringVar(value='selection')
+        join_scope=tk.StringVar(value='page')
         join_scope_row=ttk.Frame(join_box);join_scope_row.pack(fill='x',pady=6)
         join_scope_controls=[]
         for title,mode in (('Весь текущий лист','page'),('Только выделенное','selection')):
             control=ttk.Radiobutton(join_scope_row,text=title,variable=join_scope,value=mode)
             control.pack(side='left',padx=(0,20));join_scope_controls.append(control)
-        join_text=tk.StringVar(value='Выберите область оптимизации в CorelDRAW.')
+        join_text=tk.StringVar(value='Выберите область и нажмите «Проверить».')
         from tkinter.scrolledtext import ScrolledText
         join_preview_box=ScrolledText(join_box,height=10,wrap='word',font=('Segoe UI',10),state='disabled')
         join_preview_box.pack(fill='x',pady=8)
@@ -790,7 +790,16 @@ def main():
         check_log.pack(fill='x',pady=(0,4))
         check_result=tk.StringVar(value='Проверка ещё не выполнена.')
         history=[];history_views=[]
-        join_history=[]
+        join_history=[];join_history_views=[]
+        def record_join(entry):
+            join_history.append(entry)
+            for view in list(join_history_views):
+                if not view.winfo_exists():join_history_views.remove(view);continue
+                follow=view.yview()[1]>=.99
+                view.configure(state='normal')
+                if len(join_history)==1:view.delete('1.0','end')
+                view.insert('end',('\n\n' if len(join_history)>1 else '')+entry);view.configure(state='disabled')
+                if follow:view.see('end')
         def record_check(message):
             entry=time.strftime('[%H:%M:%S] ')+message
             history.append(entry)
@@ -811,6 +820,7 @@ def main():
             view.pack(fill='both',expand=True,padx=10,pady=10)
             view.insert('1.0','\n\n'.join(history if entries is None else entries) or 'Журнал пока пуст.')
             if entries is None:history_views.append(view)
+            else:join_history_views.append(view)
             view.configure(state='disabled')
         ttk.Button(check_log,text='История',command=show_check_log).pack(side='right',padx=(8,0))
         ttk.Label(check_log,textvariable=check_result,wraplength=600).pack(side='left',fill='x',expand=True)
@@ -923,7 +933,7 @@ def main():
             state['scanning']=True;state['issues']=[];render_issues()
             record_check('Проверка выполняется. Итог ещё не получен.')
             state['busy']=True;cancel_event.clear()
-            join_apply.configure(state='disabled');join_cancel.configure(state='disabled');join_entry.configure(state='disabled');join_optimize_control.configure(state='disabled')
+            join_check.configure(state='disabled');join_apply.configure(state='disabled');join_cancel.configure(state='disabled');join_entry.configure(state='disabled');join_optimize_control.configure(state='disabled')
             for control in join_scope_controls:control.configure(state='disabled')
             for control in (check,marks,clear,tolerance_entry,*check_scope_controls):control.configure(state='disabled')
             status.set('Чтение векторов из CorelDRAW…');progress.configure(mode='indeterminate');progress.start()
@@ -938,7 +948,7 @@ def main():
             state['filter']=None;state['issues']=[];render_issues()
             record_check('Общая проверка перед экспортом: сверка чертежа и параметров…')
             cancel_event.clear()
-            for control in (check,marks,clear,tolerance_entry,join_apply,join_cancel,join_entry,join_optimize_control,*join_scope_controls,*check_scope_controls):
+            for control in (check,marks,clear,tolerance_entry,join_check,join_apply,join_cancel,join_entry,join_optimize_control,*join_scope_controls,*check_scope_controls):
                 control.configure(state='disabled')
             progress.configure(mode='indeterminate');progress.start()
             commands.put(('export_check',(value,export_scope.get()=='selection',None,False)))
@@ -950,7 +960,7 @@ def main():
             for control in (check,clear,tolerance_entry,*check_scope_controls):control.configure(state=edit_state)
             marks.configure(state='normal' if state['issues'] and not exporter.busy else 'disabled')
             cancel.configure(state='disabled')
-            join_cancel.configure(state=edit_state);join_entry.configure(state=edit_state);join_optimize_control.configure(state=edit_state)
+            join_check.configure(state=edit_state);join_cancel.configure(state=edit_state);join_entry.configure(state=edit_state);join_optimize_control.configure(state=edit_state)
             for control in join_scope_controls:control.configure(state=edit_state)
         original_export_busy=exporter.on_busy
         def shared_export_busy(busy):
@@ -964,7 +974,7 @@ def main():
                 return
             cancel_event.clear()
             state['busy']=True
-            join_apply.configure(state='disabled');join_cancel.configure(state='disabled');join_entry.configure(state='disabled');join_optimize_control.configure(state='disabled')
+            join_check.configure(state='disabled');join_apply.configure(state='disabled');join_cancel.configure(state='disabled');join_entry.configure(state='disabled');join_optimize_control.configure(state='disabled')
             for control in join_scope_controls:control.configure(state='disabled')
             for control in (check,marks,clear,tolerance_entry,*check_scope_controls):control.configure(state='disabled')
             if command=='join_preview':
@@ -1030,7 +1040,7 @@ def main():
                 elif kind=='join_duplicates_moved':
                     text='Дубли перенесены на технические слои: '+str(sum(data.values()))+'.\n'+'\n'.join(f'Слой «{layer}»: {count}.' for layer,count in data.items())+'\nПеренос можно отменить в CorelDRAW (Ctrl+Z).'
                     join_report.set(text)
-                    join_history.append(time.strftime('[%H:%M:%S] ')+text)
+                    record_join(time.strftime('[%H:%M:%S] ')+text)
                     state['issues']=[];state['complete']=False;state['duplicates_moved']=0
                     render_issues();marks.configure(state='disabled')
                     check_result.set('В оптимизации перенесены дубли. Предыдущие результаты проверки устарели.')
@@ -1048,12 +1058,15 @@ def main():
                     revision,summary,changed,error,incomplete=data
                     finish()
                     if revision!=join_state['revision']:
-                        join_stage.set('Расчёт отменён' if join_state['cancelled'] else 'Ожидание нового расчёта…')
+                        join_stage.set('Расчёт отменён. Нажмите «Проверить» для нового расчёта.')
+                        record_join(time.strftime('[%H:%M:%S] ')+'Проверка оптимизации отменена или устарела. '+join_state.get('check_context',''))
                     elif error:
                         join_stage.set('Расчёт не завершён');join_text.set(error);status.set(error)
+                        record_join(time.strftime('[%H:%M:%S] ')+'Проверка оптимизации НЕ завершена. '+join_state.get('check_context','')+'\n'+error)
                     else:
                         join_stage.set(('Расчёт завершён частично.' if incomplete else 'Расчёт завершён.')+' Соединение ещё не применено.');join_progress.configure(value=100)
                         join_text.set(('Текущая область после применения:\n' if join_report.get().startswith('Выполнено:') else '')+summary+('\nПрименять нечего: есть нерассчитанные слои.' if incomplete and not changed else '\nДополнительных изменений не требуется.' if not changed else ''))
+                        record_join(time.strftime('[%H:%M:%S] ')+('Проверка оптимизации завершена частично.' if incomplete else 'Проверка оптимизации завершена.')+'\n'+join_state.get('check_context','')+'\n'+summary+f'\nВремя: {time.monotonic()-join_state["started"]:.1f} с.')
                         join_state['ready']=revision
                         join_apply.configure(state='normal' if changed else 'disabled')
                         status.set('Предпросмотр готов. '+('Не все слои рассчитаны: см. отчёт. Применение затронет только рассчитанные изменения.' if incomplete else 'Дубли проверены. Соединение выполняется по кнопке «Применить».'))
@@ -1072,7 +1085,7 @@ def main():
                     report_text=f'Выполнено: {sum(before)} → {sum(after)} векторов.\nЗамкнутых: {before[0]} → {after[0]}; открытых: {before[1]} → {after[1]}.'
                     if details:report_text+=f'\nНовых соединений: {details[0]}; максимальное — {details[1]:.4f} мм.'
                     join_report.set(report_text+'\nОтмена — Ctrl+Z в CorelDRAW. Чертёж автоматически не сохранён.')
-                    join_history.append(time.strftime('[%H:%M:%S] ')+join_report.get()+'\n\n'+'\n\n'.join(layer_reports))
+                    record_join(time.strftime('[%H:%M:%S] ')+join_report.get()+'\n\n'+'\n\n'.join(layer_reports))
                     finish();join_state['ready']=None
                     join_text.set('Соединение применено.\nОтмена: Ctrl+Z в CorelDRAW.')
                     join_apply.configure(state='disabled')
@@ -1102,7 +1115,7 @@ def main():
                         exporter.preflight_done(dict(result,duplicates_moved=data['duplicates_moved'],reused=data['reused']),error)
                         if exporter.busy:
                             notebook.tab(check_tab,state='normal')
-                            for control in (check,marks,clear,tolerance_entry,join_apply,join_cancel,join_entry,join_optimize_control,*join_scope_controls,*check_scope_controls):
+                            for control in (check,marks,clear,tolerance_entry,join_check,join_apply,join_cancel,join_entry,join_optimize_control,*join_scope_controls,*check_scope_controls):
                                 control.configure(state='disabled')
                             status.set('Выполняется экспорт. Результаты общей проверки доступны. Не редактируйте чертёж до завершения операции.')
             if exporter.busy and exporter.request is None:
@@ -1120,15 +1133,17 @@ def main():
         join_state={'revision':0,'geometry_revision':0,'ready':None,'timer':None,'cancelled':False}
         def preview_join():
             join_state['timer']=None
-            if state['busy'] or exporter.busy:
-                join_state['timer']=root.after(100,preview_join)
-                return
+            if state['busy'] or exporter.busy:return
             try:
                 value=float(join_tolerance.get().replace(',','.'))
                 if not math.isfinite(value) or not 0<value<=1:raise ValueError()
             except ValueError:
                 join_text.set('Введите допуск больше 0\nи не больше 1 мм.');return
-            join_text.set('Пересчитываю…')
+            join_state['geometry_revision']+=1
+            join_state['revision']+=1;join_state['ready']=None;join_state['cancelled']=False
+            join_state['check_context']=('Весь текущий лист' if join_scope.get()=='page' else 'Только выделенное')+f'; допуск: {value:g} мм; непрерывные векторы: '+('да' if join_optimize.get() else 'нет')
+            record_join(time.strftime('[%H:%M:%S] ')+ 'Проверка оптимизации начата. '+join_state['check_context'])
+            join_text.set('Проверяю…')
             action('join_preview',(join_state['revision'],value,join_state['geometry_revision'],join_optimize.get(),join_scope.get()=='selection'))
         def schedule_join(*args):
             if join_state.get('calculating'):join_cancel_event.set()
@@ -1136,8 +1151,9 @@ def main():
             join_state['revision']+=1;join_state['ready']=None
             join_apply.configure(state='disabled')
             if join_state['timer'] is not None:root.after_cancel(join_state['timer'])
-            if notebook.select()==str(join_tab):join_state['timer']=root.after(150,preview_join)
-            else:join_state['timer']=None
+            join_state['timer']=None
+            if not join_state.get('calculating') and not join_state.get('applying'):
+                join_stage.set('Нужна проверка — нажмите «Проверить».')
         def schedule_join_geometry(*args):
             join_state['geometry_revision']+=1
             schedule_join()
@@ -1149,10 +1165,12 @@ def main():
             join_state['timer']=None
             join_apply.configure(state='disabled')
             join_text.set('Предпросмотр отменён. Перенесённые дубли остаются на технических слоях; отмена переноса — Ctrl+Z.')
-            status.set('Предпросмотр отменён. Новое выделение или допуск запустит пересчёт.')
+            status.set('Предпросмотр отменён. Для нового расчёта нажмите «Проверить».')
         def apply_join_preview():
             if state['busy'] or join_state['ready']!=join_state['revision']:return
             action('join_apply')
+        join_check=ttk.Button(join_box,text='Проверить',command=preview_join,style='Accent.TButton')
+        join_check.pack(side='left',padx=(0,8),pady=(16,0))
         join_apply=ttk.Button(join_box,text='Применить',command=apply_join_preview,state='disabled')
         join_apply.pack(side='left',pady=(16,0))
         join_cancel=ttk.Button(join_box,text='Отменить',command=cancel_join_preview)
