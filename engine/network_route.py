@@ -68,7 +68,8 @@ def refine(first,second,t,u,epsilon):
     return None
 
 
-def build_network(contours,tolerance):
+def build_network(contours,tolerance,progress=None):
+    report=progress or (lambda *args:None)
     if not math.isfinite(tolerance) or not .001<=tolerance<=1:
         raise ValueError('Допуск должен быть от 0,001 до 1 мм.')
     if len({c.get('layer','') for c in contours})>1:
@@ -82,13 +83,17 @@ def build_network(contours,tolerance):
             tips.extend([(base,0),(len(source)-1,1)])
     if not source:raise ValueError('Нет участков для расчёта.')
     cuts=[{0.0,1.0} for _ in source]
-    polylines=[samples(s,approximation) for s in source]
+    polylines=[]
+    for index,segment in enumerate(source):
+        report("Подготовка участков",index,len(source))
+        polylines.append(samples(segment,approximation))
     spans=[]
     for index,points in enumerate(polylines):
         for (t,a),(u,b) in zip(points,points[1:]):
             spans.append((min(a[0],b[0]),max(a[0],b[0]),min(a[1],b[1]),max(a[1],b[1]),index,t,u,a,b))
     spans.sort();active=[]
-    for current in spans:
+    for span_index,current in enumerate(spans):
+        report("Поиск пересечений",span_index,len(spans))
         active=[old for old in active if old[1]+epsilon>=current[0]]
         for old in active:
             if old[3]+epsilon<current[2] or current[3]+epsilon<old[2]:continue
@@ -125,7 +130,8 @@ def build_network(contours,tolerance):
             for y in range(math.floor((span[2]-tolerance-approximation)/cell),math.floor((span[3]+tolerance+approximation)/cell)+1):
                 buckets.setdefault((x,y),[]).append(span)
     gaps=[]
-    for si,st in tips:
+    for tip_index,(si,st) in enumerate(tips):
+        report("Поиск соединений в допуске",tip_index,len(tips))
         point=value(source[si],st)
         candidates={}
         for span in buckets.get((math.floor(point[0]/cell),math.floor(point[1]/cell)),[]):
@@ -166,6 +172,7 @@ def build_network(contours,tolerance):
         if weight<=epsilon:return
         edges.append(dict(u=u,v=v,segment=(kind,p),weight=weight,source=origin,required=required))
     for index,segment in enumerate(source):
+        report("Разделение кривых на пересечениях",index,len(source))
         parameters=sorted(cuts[index]);unique=[parameters[0]]
         for t in parameters[1:]:
             if t-unique[-1]>1e-9:unique.append(t)

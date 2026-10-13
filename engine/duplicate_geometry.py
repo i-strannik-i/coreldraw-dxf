@@ -33,12 +33,14 @@ def contour_key(contour):
     return bool(contour['closed']),min(forward,backward)
 
 
-def duplicate_groups(contours):
+def duplicate_groups(contours,progress=None):
+    report=progress or (lambda *args:None)
     objects=defaultdict(list)
     for contour in contours:
         objects[(contour['layer'],contour['id'])].append(contour)
     geometry=defaultdict(list)
-    for (layer,sid),parts in objects.items():
+    for number,((layer,sid),parts) in enumerate(objects.items()):
+        report(number,len(objects)+len(contours))
         if not parts or any(not p['segments'] for p in parts):continue
         key=(layer,tuple(sorted(contour_key(p) for p in parts)))
         geometry[key].append(sid)
@@ -53,7 +55,8 @@ def duplicate_groups(contours):
     whole_copies={(group['layer'],sid) for group in groups for sid in group['copies']}
     paths=defaultdict(list)
     ordinals=defaultdict(int)
-    for contour in contours:
+    for number,contour in enumerate(contours):
+        report(len(objects)+number,len(objects)+len(contours))
         sid=contour['id'];layer=contour['layer']
         index=contour.get('subpath',ordinals[(layer,sid)])
         ordinals[(layer,sid)]+=1
@@ -67,6 +70,7 @@ def duplicate_groups(contours):
             ids=sorted({sid for sid,_,_ in parts}),keep=parts[0][0],
             copies=[sid for sid,_,_ in parts[1:]],members=members,
             point=parts[0][2]['segments'][0][1][0],approx=False))
+    report(len(objects)+len(contours),len(objects)+len(contours))
     return groups
 
 

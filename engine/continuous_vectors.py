@@ -11,7 +11,8 @@ except ImportError:
     from network_route import build_network
 
 
-def continuous_vectors(contours,tolerance,coordinate_scale=None):
+def continuous_vectors(contours,tolerance,coordinate_scale=None,progress=None):
+    report=progress or (lambda *args:None)
     seen=set()
     for contour in contours:
         for kind,p in contour['segments']:
@@ -20,7 +21,7 @@ def continuous_vectors(contours,tolerance,coordinate_scale=None):
             key=(kind,min(key,tuple(reversed(key))))
             if key in seen:raise ValueError('Есть совпадающие участки. Сначала выполните проверку дублей и наложений.')
             seen.add(key)
-    graph=build_network(contours,tolerance)
+    graph=build_network(contours,tolerance,progress=report)
     edges,vertices=graph['edges'],graph['vertices']
     degree=[0]*len(vertices);parent=list(range(len(vertices)))
     def root(u):
@@ -47,7 +48,9 @@ def continuous_vectors(contours,tolerance,coordinate_scale=None):
         delta=2-2*(degree[u]%2+degree[v]%2)
         if a==b:return (max(1,odd[a]//2)-max(1,(odd[a]+delta)//2),-delta)
         return (max(1,odd[a]//2)+max(1,odd[b]//2)-max(1,(odd[a]+odd[b]+delta)//2),-delta)
+    candidates_count=len(remaining)
     while remaining:
+        report("Выбор соединений",candidates_count-len(remaining),candidates_count)
         best=max(remaining,key=lambda i:(benefit(i),-edges[i]['weight'],-i))
         if benefit(best)<=(0,0):break
         remaining.remove(best);selected.append(best)
@@ -57,7 +60,8 @@ def continuous_vectors(contours,tolerance,coordinate_scale=None):
     groups={}
     for i in selected:groups.setdefault(root(edges[i]['u']),[]).append(i)
     routes=[];minimum=0
-    for group in groups.values():
+    for group_index,group in enumerate(groups.values()):
+        report("Объединение в непрерывные векторы",group_index,len(groups))
         adjacency={}
         def add(i,u,v):
             adjacency.setdefault(u,[]).append((i,v));adjacency.setdefault(v,[]).append((i,u))
@@ -124,3 +128,22 @@ def corel_segments(segments,scale):
         result.append((kind,points))
     if not result:raise ValueError('Вектор меньше точности координат CorelDRAW. Изменения не применены.')
     return result
+
+
+def same_vectors(before,after,scale):
+    """Ignore contour order, orientation and closed-path start nodes only."""
+    from collections import Counter
+    def key(contour):
+        segments=[]
+        for kind,points in corel_segments(contour['segments'],scale):
+            points=points if kind=='B' else (points[0],points[-1])
+            segments.append((kind,tuple(tuple(round(v/scale,4) for v in p) for p in points)))
+        forward=tuple(segments)
+        reverse=tuple((kind,tuple(reversed(points))) for kind,points in reversed(segments))
+        if contour['closed'] and segments:
+            def rotate(seq):
+                smallest=min(seq)
+                return min(seq[i:]+seq[:i] for i,item in enumerate(seq) if item==smallest)
+            forward,reverse=rotate(forward),rotate(reverse)
+        return bool(contour['closed']),min(forward,reverse)
+    return Counter(map(key,before))==Counter(map(key,after))

@@ -21,6 +21,15 @@ class JoinProgressTests(unittest.TestCase):
         self.assertLess(events.index(('Создание векторов',3,3)),events.index(('Замена исходных объектов',0,0)))
         s.doc.EndCommandGroup.assert_called_once();s.doc.Undo.assert_not_called()
 
+    def test_ordering_does_not_move_results_between_layers(self):
+        s=self.session()
+        first,second=Mock(),Mock()
+        first.Layer.Name='A';second.Layer.Name='B'
+        s.join_outputs=[(first,Mock()),(second,Mock())]
+        s._apply_join()
+        first.Layer.CreateCurve.return_value.OrderBackOf.assert_not_called()
+        second.Layer.CreateCurve.return_value.OrderBackOf.assert_not_called()
+
     def test_failure_reports_rollback(self):
         s=self.session();events=[]
         s.join_outputs[1][0].Layer.CreateCurve.side_effect=RuntimeError('test')

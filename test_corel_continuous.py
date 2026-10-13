@@ -1,6 +1,6 @@
 import math
 import unittest
-from engine.continuous_vectors import continuous_vectors,continuous_summary,corel_segments
+from engine.continuous_vectors import continuous_vectors,continuous_summary,corel_segments,same_vectors
 from engine.network_route import value
 from test_corel_network_route import contour
 
@@ -20,6 +20,31 @@ class ContinuousTests(unittest.TestCase):
         for r in plan['routes']:
             for a,b in zip(r['segments'],r['segments'][1:]):self.assertLess(math.dist(a[1][-1],b[1][0]),1e-6)
         return plan
+
+    def test_progress_preserves_geometry_and_can_cancel(self):
+        source=[contour([(0,0),(10,0),(10,10),(0,.05)])]
+        events=[]
+        actual=continuous_vectors(source,.1,progress=lambda *e:events.append(e))
+        self.assertEqual(actual,continuous_vectors(source,.1))
+        self.assertTrue(any(e[0]=='Поиск пересечений' for e in events))
+        for target in {e[0] for e in events}:
+            def cancel(stage,done,total):
+                if stage==target:raise InterruptedError('cancel')
+            with self.assertRaises(InterruptedError):continuous_vectors(source,.1,progress=cancel)
+
+    def test_unchanged_vectors_ignore_direction_and_order(self):
+        source=[contour([(0,0),(10,0)]),contour([(0,2),(10,2)])]
+        reverse=[contour([(10,2),(0,2)]),contour([(10,0),(0,0)])]
+        self.assertTrue(same_vectors(source,reverse,1))
+        self.assertFalse(same_vectors(source,reverse[:1],1))
+        self.assertFalse(same_vectors(source,[contour([(0,0),(10,0),(0,2),(10,2)])],1))
+
+    def test_unchanged_closed_start_point(self):
+        a=[contour([(0,0),(10,0),(10,10),(0,0)],True)]
+        b=[contour([(10,0),(10,10),(0,0),(10,0)],True)]
+        self.assertTrue(same_vectors(a,b,1))
+        b[0]['closed']=False
+        self.assertFalse(same_vectors(a,b,1))
 
     def test_tail_first_one_open(self):
         p=self.verify([contour([(0,0),(10,0),(10,10),(0,10),(0,0)],True),contour([(0,0),(-3,0)])])

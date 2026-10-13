@@ -42,21 +42,24 @@ def intersection(a,b,c,d):
     return None
 
 
-def audit(contours, *, tolerance=.1, limit=1000, progress=None, cancelled=None):
+def audit(contours, *, tolerance=.1, limit=1000, progress=None, cancelled=None, layer_done=None):
     if not math.isfinite(tolerance) or not .001 <= tolerance <= 1:
         raise ValueError('Допуск проверки: от 0,001 до 1 мм.')
     layers = defaultdict(list)
     for contour in contours:
         layers[contour['layer']].append(contour)
-    result = dict(issues=[], complete=True, segments=0, comparisons=0)
+    result = dict(issues=[], complete=True, segments=0, comparisons=0, layers=[])
     for index, (layer, items) in enumerate(layers.items()):
         def report(stage, done, total):
             if cancelled and cancelled():
-                raise InterruptedError('Проверка отменена. Частичные результаты не показаны.')
+                raise InterruptedError('Проверка отменена. Итоги завершённых слоёв сохранены в журнале.')
             if progress:
                 progress(layer, index + 1, len(layers), stage, done, total)
         # Each layer owns its own budget; one busy layer cannot hide the rest.
         part = _audit_layer(items, tolerance, limit, report)
+        part=dict(part,layer=layer,count=len(items))
+        result['layers'].append(part)
+        if layer_done:layer_done(part)
         result['issues'].extend(part['issues'])
         result['segments'] += part['segments']
         result['comparisons'] += part['comparisons']
@@ -68,7 +71,7 @@ def audit(contours, *, tolerance=.1, limit=1000, progress=None, cancelled=None):
 def _audit_layer(contours, tolerance, limit, report):
     issues, seen, spans = [],set(),[]
     report('Поиск дублей',0,len(contours))
-    duplicates=duplicate_groups(contours)
+    duplicates=duplicate_groups(contours,lambda done,total:report('Поиск дублей',done,total))
     whole_copies,partial_copies=duplicate_removals(duplicates)
     issues.extend(duplicates[:limit])
     def add(kind,point,ids,layer,approx=False):

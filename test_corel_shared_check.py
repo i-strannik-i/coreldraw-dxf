@@ -16,7 +16,7 @@ class Session:
         self.signature=CorelSession.digest(self.contours)
         return self.contours,self.skipped
 
-    def quarantine_duplicates(self, cancelled):
+    def quarantine_duplicates(self, cancelled,progress=None):
         return self.moved
 
 

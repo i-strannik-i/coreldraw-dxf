@@ -22,7 +22,7 @@ class DuplicateTests(unittest.TestCase):
         session.contours=[a,b,c]
         session.refs={1:object(),2:object(),3:object()}
         refs=dict(session.refs)
-        def move(groups, preserve_selection=False):
+        def move(groups, preserve_selection=False,progress=None):
             self.assertTrue(preserve_selection)
             self.assertEqual(groups[0]['copies'],[2])
             session.contours=[];session.refs={}
