@@ -7,3 +7,7 @@ corel_export/package/
 *.exe
 *.zip
 corel_export/CorelDXF-latest.json
+
+# Generated application bundles
+/build/
+/dist/
