@@ -138,7 +138,8 @@ def convert(source, output_dir, tolerance=0, progress=None, optimize_tolerance=0
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
     progress('Подключение к CorelDRAW')
-    app = win32com.client.gencache.EnsureDispatch('CorelDRAW.Application.25')
+    from corel_connection import connect
+    app = connect()
     previous = app.ActiveDocument if app.Documents.Count else None
     if previous is None:
         # COM can start Corel invisibly; expose startup dialogs before OpenDocument.

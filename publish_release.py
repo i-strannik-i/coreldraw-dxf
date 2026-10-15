@@ -16,6 +16,7 @@ def main():
     installer = root / (INSTALLER_NAME + '.exe')
     data = installer.read_bytes()
     info = {'product': 'CorelDXF', 'version': VERSION, 'channel': CHANNEL, 'corel_major': 25,
+            'corel_majors': [25, 26, 27],
             'file': installer.name, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
     manifest = root / 'CorelDXF-latest.json'
     manifest.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding='utf-8')

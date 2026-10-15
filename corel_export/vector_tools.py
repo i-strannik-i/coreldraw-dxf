@@ -97,7 +97,8 @@ def draw_issue_symbol(canvas, kind, color):
 class CorelSession:
     def __init__(self):
         import win32com.client
-        self.app = win32com.client.gencache.EnsureDispatch('CorelDRAW.Application.25')
+        from corel_connection import connect
+        self.app = connect()
         if not self.app.Documents.Count:
             raise ValueError('Откройте документ CorelDRAW.')
         self.doc = self.app.ActiveDocument

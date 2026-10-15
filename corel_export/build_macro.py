@@ -4,8 +4,8 @@ import sys
 import win32com.client
 
 
-def build(destination):
-    app = win32com.client.gencache.EnsureDispatch('CorelDRAW.Application.25')
+def build(destination, major=25):
+    app = win32com.client.gencache.EnsureDispatch(f'CorelDRAW.Application.{major}')
     if not app.InitializeVBA():
         raise RuntimeError('CorelDRAW VBA is unavailable')
     destination = Path(destination).resolve()
@@ -155,4 +155,4 @@ End Sub
 
 
 if __name__ == '__main__':
-    build(sys.argv[1])
+    build(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 25)

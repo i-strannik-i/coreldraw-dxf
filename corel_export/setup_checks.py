@@ -8,6 +8,10 @@ import sys
 import time
 import winreg
 
+if not getattr(sys, 'frozen', False):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'engine'))
+from corel_connection import SUPPORTED_MAJORS, version_label
+
 
 def discover():
     found = []
@@ -30,7 +34,7 @@ def validate_binary(path):
         offset = struct.unpack('<I', stream.read(4))[0]
         stream.seek(offset)
         if stream.read(4) != b'PE\0\0' or stream.read(2) != b'\x64\x86':
-            raise RuntimeError('Нужен CorelDRAW 2024 x64. Эта сборка не поддерживает 32-битный Corel.')
+            raise RuntimeError('Нужен CorelDRAW x64. Эта сборка не поддерживает 32-битный Corel.')
 
 
 def repair_path(executable):
@@ -42,7 +46,7 @@ def vba_packages(executable):
     folder = Path(executable).parent.parent / 'Setup' / 'MSIs'
     packages = [folder / 'VBA/Vba71.msi', folder / 'VBA/Vba71_1033.MSI', folder / 'VBA_x64.msi']
     if not all(path.is_file() for path in packages):
-        raise RuntimeError('В локальном комплекте Corel нет полного набора VBA. Нужен официальный установочный комплект CorelDRAW 2024.')
+        raise RuntimeError('В локальном комплекте Corel нет полного набора VBA. Нужен официальный комплект выбранной версии CorelDRAW.')
     return packages
 
 
@@ -85,7 +89,7 @@ def install_vba(executable, log_folder, status):
             raise RuntimeError('Установка VBA остановлена, код ' + str(code) + '. Журнал: ' + str(log))
 
 
-def probe(output, installed=False):
+def probe(output, installed=False, major=25):
     import pythoncom
     import win32com.client
     try:
@@ -98,23 +102,28 @@ def probe(output, installed=False):
     try:
         if corel_running():
             raise RuntimeError('Сохраните документы и закройте CorelDRAW. Проверка не закрывает ваши окна.')
-        app = win32com.client.DispatchEx('CorelDRAW.Application.25')
-        major = int(app.VersionMajor)
-        if major != 25:
-            raise RuntimeError('COM запустил другую версию CorelDRAW: ' + str(major))
+        if major not in SUPPORTED_MAJORS:
+            raise RuntimeError('Версия CorelDRAW не поддерживается этим установщиком.')
+        app = win32com.client.DispatchEx(f'CorelDRAW.Application.{major}')
+        actual = int(app.VersionMajor)
+        if actual != major:
+            raise RuntimeError('COM запустил другую версию CorelDRAW: ' + str(actual))
         result['version'] = str(app.Version)
         result['kind'] = 'vba'
         if not app.InitializeVBA():
             raise RuntimeError('CorelDRAW не смог инициализировать VBA.')
         count = int(app.GMSManager.Projects.Count)
         result['projects'] = count
+        if not installed:
+            result['gms_path'] = str(app.GMSManager.UserGMSPath)
+            result['workspace_path'] = str(app.UserWorkspacePath)
         # Access the runtime, not the VB project editor (which may be policy-blocked).
         if installed:
             result['kind'] = 'macro'
             diagnostic = str(app.GMSManager.RunMacro('SkladCorelDXF', 'ExportDXF.InstallationCheck'))
             if diagnostic != 'SKLAD_DXF_OK':
                 raise RuntimeError('Макрос запустился, но не нашёл конвертер: ' + diagnostic)
-        result.update(ok=True, kind='ok', message='CorelDRAW 2024 x64 и VBA работают.')
+        result.update(ok=True, kind='ok', message=version_label(major) + ' x64 и VBA работают.')
     except Exception as error:
         result['message'] = str(error)
     finally:
@@ -130,12 +139,13 @@ def probe(output, installed=False):
         Path(output).write_text(json.dumps(result, ensure_ascii=False), encoding='utf-8')
 
 
-def run_probe(folder, installed=False):
+def run_probe(folder, installed=False, major=25):
     output = Path(folder) / ('verify.json' if installed else 'preflight.json')
     args = [sys.executable]
     if not getattr(sys, 'frozen', False):
         args.append(str(Path(__file__).with_name('setup_corel.py')))
     args.extend(['--probe', str(output)])
+    args.extend(['--corel-major', str(major)])
     if installed:
         args.append('--installed')
     try:

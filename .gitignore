@@ -1,4 +1,5 @@
 __pycache__/
+.venv/
 *.pyc
 corel_export/build/
 corel_export/dist/

@@ -12,6 +12,9 @@ import tempfile
 import threading
 import urllib.request
 
+if not getattr(sys, 'frozen', False):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'engine'))
+
 try:
     from .version import VERSION, CHANNEL
 except ImportError:
@@ -129,7 +132,10 @@ def check_release(folder, current=VERSION):
 
 
 def validate_info(info, current):
-    if info.get('product') != 'CorelDXF' or info.get('corel_major') != 25:
+    from corel_connection import configured_major
+    major = configured_major() or 25
+    supported = info.get('corel_majors', [info.get('corel_major')])
+    if info.get('product') != 'CorelDXF' or not isinstance(supported, list) or major not in supported:
         raise ValueError('Обновление предназначено для другого продукта или Corel.')
     version = info.get('version')
     version_tuple(version)

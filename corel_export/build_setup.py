@@ -28,6 +28,7 @@ subprocess.run([
     sys.executable, '-m', 'PyInstaller', '--noconfirm', '--onefile', '--windowed',
     '--name', INSTALLER_NAME, '--icon', str(root / 'icons/CorelDXF.ico'),
     '--hidden-import', 'win32timezone',
+    '--paths', str(root.parent / 'engine'),
     '--add-data', str(root / 'CorelDXF_2024.zip') + ';.',
     '--distpath', str(root), '--workpath', str(root / 'build/setup'),
     '--specpath', str(root), str(root / 'setup_corel.py'),

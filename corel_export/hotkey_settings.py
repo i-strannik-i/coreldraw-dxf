@@ -14,6 +14,10 @@ import time
 import xml.etree.ElementTree as ET
 import zipfile
 
+if not getattr(sys, 'frozen', False):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'engine'))
+from corel_connection import connect
+
 EXPORT = '87260fe1-e755-4c95-9f68-2aa2f3dc5001'
 MAIN = 'bc175625-191c-4b95-9053-756e5eee26fe'
 
@@ -140,7 +144,7 @@ def run():
     import win32com.client
     if not corel_running():
         raise ValueError('Откройте CorelDRAW и запустите настройки из окна DXF.')
-    app = win32com.client.Dispatch('CorelDRAW.Application.25')
+    app = connect()
     path = Path(app.UserWorkspacePath) / (app.ActiveWorkspace.Name + '.cdws')
     captions = {}
     del app
@@ -171,7 +175,7 @@ def run():
             import pythoncom
             pythoncom.CoInitialize()
             try:
-                corel = win32com.client.Dispatch('CorelDRAW.Application.25')
+                corel = connect()
                 handle = corel.FrameWork.MainFrameWindow.Handle
                 process_id = ctypes.c_ulong()
                 ctypes.windll.user32.GetWindowThreadProcessId(handle, ctypes.byref(process_id))
@@ -280,7 +284,7 @@ def run():
             for entry in state['expected']:
                 guid = ET.fromstring(entry).get('itemRef')
                 try:
-                    corel = win32com.client.Dispatch('CorelDRAW.Application.25')
+                    corel = connect()
                     captions[guid] = corel.FrameWork.Automation.GetCaptionText(guid).replace('&', '')
                 except Exception:
                     pass

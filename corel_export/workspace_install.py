@@ -22,18 +22,24 @@ def merge_workspace(data, icons):
     root = ET.fromstring(source.read('content/workspace.xml'), parser=parser)
     items = root.find('items')
     bars = root.find('commandBars')
-    if items is None or bars is None:
+    if root.tag != 'uiConfig' or bars is None:
         raise ValueError('Unsupported workspace structure')
-    old_items = {x.get('guid') for x in items
+    old_items = {x.get('guid') for x in (items if items is not None else [])
                  if 'SkladCorelDXF' in x.get('dynamicCommand', '')}
     standard = bars.find(f'commandBarData[@guid="{STANDARD}"]/toolbar')
-    if standard is None:
+    if standard is None and not root.findall(f'.//toolbar[@guidRef="{STANDARD}"]'):
         raise ValueError('Workspace has no standard toolbar anchor')
     # Keep the original XML formatting and unrelated nodes byte-for-byte.
     xml = source.read('content/workspace.xml').decode('utf-8')
+    # New Corel installations can save only workspace overrides. The default
+    # Standard toolbar and command definitions then live in Corel's base UI.
+    if items is None:
+        xml = xml.replace('</uiConfig>', '<items></items></uiConfig>', 1)
+    else:
+        xml = re.sub(r'<items\s*/>', '<items></items>', xml, count=1)
     # Corel may regenerate command GUIDs after a macro reload. Keep user
     # shortcuts connected when normalizing our two installed command IDs.
-    for item in items:
+    for item in (items if items is not None else []):
         command = item.get('dynamicCommand', '')
         mapped = {'SkladCorelDXF.ExportDXF.'+macro: guid for guid,caption,macro,icon in BUTTONS}.get(command)
         old = item.get('guid')
